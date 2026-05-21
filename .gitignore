@@ -1,0 +1,38 @@
+# Binaries
+proxy
+proxy.exe
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test
+*.test
+*.out
+coverage.txt
+
+# Vendor (use go mod)
+/vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# WAL data
+wal-*.jsonl
+wal-offset.json
+
+# Local env
+.env
+
+# Planning docs (not part of shipped product)
+implementation.txt
+
+# IDE/Tools
+.claude/
