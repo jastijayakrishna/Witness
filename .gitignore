@@ -1,6 +1,6 @@
 # Binaries
-proxy
-proxy.exe
+/proxy
+/proxy.exe
 *.exe
 *.dll
 *.so

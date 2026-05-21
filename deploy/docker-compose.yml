@@ -1,0 +1,59 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: witness
+      POSTGRES_PASSWORD: witness
+      POSTGRES_DB: witness
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U witness"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  proxy:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      WITNESS_SERVER_HOST: "0.0.0.0"
+      WITNESS_SERVER_PORT: "8080"
+      WITNESS_POSTGRES_HOST: "postgres"
+      WITNESS_POSTGRES_PORT: "5432"
+      WITNESS_POSTGRES_USER: "witness"
+      WITNESS_POSTGRES_PASSWORD: "witness"
+      WITNESS_POSTGRES_DBNAME: "witness"
+      WITNESS_POSTGRES_SSLMODE: "disable"
+      WITNESS_REDIS_HOST: "redis"
+      WITNESS_REDIS_PORT: "6379"
+      WITNESS_WAL_DIR: "/data/wal"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ../configs:/app/configs:ro
+      - waldata:/data/wal
+
+volumes:
+  pgdata:
+  waldata:
