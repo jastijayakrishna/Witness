@@ -34,6 +34,677 @@ Later (Phase 2+), we'll:
 But for Phase 0+1, we just CAPTURE the data. That's it.
 
 ================================================================================
+REAL-WORLD EXAMPLE: ONE REQUEST, START TO FINISH
+================================================================================
+
+Let's trace a REAL request through the system with actual data at every step.
+
+SCENARIO:
+- A startup called "Acme Corp" is building a chatbot
+- Their backend makes an API call to GPT-4o-mini
+- They've configured our proxy as their base_url
+- We'll follow this request through EVERY LINE of code
+
+------------------------------------------------------------------------
+STEP 0: THE SETUP (Before the request arrives)
+------------------------------------------------------------------------
+
+Docker Compose is running:
+  Container 1: postgres (port 5432)
+  Container 2: redis (port 6379)
+  Container 3: proxy (port 8080) ← This is our Go binary
+
+The proxy binary has:
+  - Loaded config from configs/proxy.yaml
+  - Connected to Postgres (pgxpool with 10 connections ready)
+  - Connected to Redis (pinged successfully)
+  - Created WAL writer pointing to /data/wal/
+  - Started HTTP server listening on 0.0.0.0:8080
+  - Registered routes: /healthz, /metrics, and wildcard for proxying
+
+Current time: 2026-05-21 14:35:22.123 UTC
+
+------------------------------------------------------------------------
+STEP 1: CLIENT MAKES REQUEST (14:35:22.123 UTC)
+------------------------------------------------------------------------
+
+Acme's Python backend executes this code:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8080/openai/v1",
+    api_key="sk-proj-acme-live-abc123xyz789",
+    default_headers={"X-Project": "acme-chatbot"}
+)
+
+response = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[
+        {"role": "user", "content": "What is the capital of France?"}
+    ]
+)
+
+print(response.choices[0].message.content)
+```
+
+This generates an HTTP request:
+
+```http
+POST /openai/v1/chat/completions HTTP/1.1
+Host: localhost:8080
+Authorization: Bearer sk-proj-acme-live-abc123xyz789
+X-Project: acme-chatbot
+Content-Type: application/json
+Content-Length: 142
+
+{
+  "model": "gpt-4o-mini",
+  "messages": [
+    {"role": "user", "content": "What is the capital of France?"}
+  ]
+}
+```
+
+The request arrives at the proxy container on port 8080.
+
+------------------------------------------------------------------------
+STEP 2: CHI ROUTER RECEIVES REQUEST (14:35:22.124 UTC, +1ms)
+------------------------------------------------------------------------
+
+File: cmd/proxy/main.go, line 78
+
+Chi router's middleware chain runs:
+
+1. middleware.RealIP
+   - Extracts real client IP (in this case, Docker bridge: 172.17.0.1)
+
+2. middleware.RequestID
+   - Generates request ID: "req-a1b2c3d4"
+   - Adds to context, will appear in all logs for this request
+
+3. metricsMiddleware (our custom middleware)
+   - Starts timer for latency tracking
+   - Will increment prometheus counter when request completes
+
+Chi router matches the path:
+  - Path: /openai/v1/chat/completions
+  - No specific route matches
+  - Falls through to wildcard handler: proxyHandler.ServeHTTP()
+
+------------------------------------------------------------------------
+STEP 3: PROXY HANDLER STARTS (14:35:22.125 UTC, +2ms)
+------------------------------------------------------------------------
+
+File: internal/proxy/handler.go, line 23
+
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+    // 1. Lookup provider by path prefix
+    provider := providers.Lookup(r.URL.Path)
+
+Lookup logic (internal/providers/provider.go, line 45):
+  - Path: "/openai/v1/chat/completions"
+  - Check registry:
+    - "/openai" prefix matches? YES ✓
+  - Returns: openai provider struct
+
+Provider struct contains:
+  - Name: "openai"
+  - PathPrefix: "/openai"
+  - Target: https://api.openai.com
+  - ExtractUsage: func to parse response.usage.{prompt_tokens, ...}
+  - PrepareStreamBody: func to inject stream_options
+  - IsStreamRequest: func to check if "stream":true
+
+    // 2. Read request body
+    body, _ := io.ReadAll(r.Body)
+    r.Body.Close()
+
+body now contains (142 bytes):
+```json
+{"model":"gpt-4o-mini","messages":[{"role":"user","content":"What is the capital of France?"}]}
+```
+
+    // 3. Resolve project attribution
+    project := ResolveProject(r)
+
+Attribution logic (internal/proxy/attribution.go, line 8):
+
+Step 1: Check X-Project header
+  - r.Header.Get("X-Project") = "acme-chatbot"
+  - NOT EMPTY → return "acme-chatbot" ✓
+
+Result: project = "acme-chatbot"
+
+(If X-Project was missing, it would fall back to:
+  - SHA256("Bearer sk-proj-acme-live-abc123xyz789")
+  - = 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+  - Truncate to 16 bytes = 9f86d081884c7d65
+  - project = "key:9f86d081884c7d65"
+)
+
+    // 4. Check if streaming request
+    isStream := provider.IsStreamRequest(body)
+
+IsStreamRequest logic (internal/providers/openai.go, line 89):
+```go
+var req struct {
+    Stream bool `json:"stream"`
+}
+json.Unmarshal(body, &req)
+return req.Stream  // false in our case
+```
+
+Result: isStream = false → Call handleNonStream()
+
+------------------------------------------------------------------------
+STEP 4: NON-STREAMING HANDLER (14:35:22.126 UTC, +3ms)
+------------------------------------------------------------------------
+
+File: internal/proxy/handler.go, line 45
+
+    start := time.Now()  // 14:35:22.126 UTC
+
+    // Build upstream URL
+    upstreamPath := strings.TrimPrefix(r.URL.Path, provider.PathPrefix)
+    // r.URL.Path = "/openai/v1/chat/completions"
+    // provider.PathPrefix = "/openai"
+    // upstreamPath = "/v1/chat/completions"
+
+    upstreamURL := provider.Target.String() + upstreamPath
+    // = "https://api.openai.com" + "/v1/chat/completions"
+    // = "https://api.openai.com/v1/chat/completions"
+
+    // Create upstream request
+    upReq, _ := http.NewRequestWithContext(
+        r.Context(),
+        "POST",
+        "https://api.openai.com/v1/chat/completions",
+        bytes.NewReader(body),
+    )
+
+    // Copy headers from client request
+    copyHeaders(r.Header, upReq.Header)
+
+Headers copied:
+  ✓ Authorization: Bearer sk-proj-acme-live-abc123xyz789
+  ✓ Content-Type: application/json
+  ✗ X-Project: acme-chatbot (FILTERED OUT - internal header)
+
+upReq.Header.Set("Content-Length", "142")
+
+------------------------------------------------------------------------
+STEP 5: FORWARD TO OPENAI (14:35:22.127 UTC, +4ms)
+------------------------------------------------------------------------
+
+    resp, err := h.Transport.RoundTrip(upReq)
+
+What happens here (network call):
+  1. DNS lookup: api.openai.com → 104.18.7.192
+  2. TLS handshake (connection pooling, so might be cached)
+  3. Send HTTP request to OpenAI:
+     POST /v1/chat/completions
+     Authorization: Bearer sk-proj-acme-live-abc123xyz789
+     Content-Type: application/json
+
+     {"model":"gpt-4o-mini","messages":[...]}
+
+  4. OpenAI processes request:
+     - Validates API key
+     - Routes to GPT-4o-mini model
+     - Generates response: "The capital of France is Paris."
+     - Counts tokens: 11 input, 7 output
+
+  5. OpenAI sends response (14:35:22.305 UTC, +178ms later):
+     HTTP/1.1 200 OK
+     Content-Type: application/json
+
+     {
+       "id": "chatcmpl-9b2f1g3h4j5k6l7m8n9o0p1q",
+       "object": "chat.completion",
+       "created": 1716298522,
+       "model": "gpt-4o-mini-2024-07-18",
+       "choices": [
+         {
+           "index": 0,
+           "message": {
+             "role": "assistant",
+             "content": "The capital of France is Paris."
+           },
+           "finish_reason": "stop"
+         }
+       ],
+       "usage": {
+         "prompt_tokens": 11,
+         "completion_tokens": 7,
+         "total_tokens": 18
+       }
+     }
+
+------------------------------------------------------------------------
+STEP 6: PROCESS OPENAI RESPONSE (14:35:22.306 UTC, +183ms)
+------------------------------------------------------------------------
+
+    respBody, _ := io.ReadAll(resp.Body)
+    latency := time.Since(start)
+    // latency = 180ms (network round-trip to OpenAI)
+
+    // Extract usage
+    usage, _ := provider.ExtractUsage(respBody)
+
+ExtractUsage logic (internal/providers/openai.go, line 34):
+```go
+var resp openaiResponse
+json.Unmarshal(respBody, &resp)
+
+// resp.Model = "gpt-4o-mini-2024-07-18"
+// resp.Usage.PromptTokens = 11
+// resp.Usage.CompletionTokens = 7
+// resp.Usage.TotalTokens = 18
+
+return Usage{
+    InputTokens:  11,
+    OutputTokens: 7,
+    TotalTokens:  18,
+    Model:        "gpt-4o-mini-2024-07-18",
+}
+```
+
+Result:
+  usage.InputTokens = 11
+  usage.OutputTokens = 7
+  usage.TotalTokens = 18
+  usage.Model = "gpt-4o-mini-2024-07-18"
+
+    // Compute cost
+    cost := providers.ComputeCost(usage.Model, usage.InputTokens, usage.OutputTokens)
+
+ComputeCost logic (internal/providers/pricing.go, line 82):
+```go
+// Lookup pricing for "gpt-4o-mini-2024-07-18"
+// (strips date suffix, uses "gpt-4o-mini")
+p := PricingTable["gpt-4o-mini"]
+// p.InputPerToken = $0.15 / 1,000,000 = $0.00000015
+// p.OutputPerToken = $0.60 / 1,000,000 = $0.00000060
+
+inputCost := 11 * 0.00000015 = $0.00000165
+outputCost := 7 * 0.00000060 = $0.00000420
+totalCost := $0.00000585
+```
+
+Result: cost = $0.00000585 (rounded: $0.0000059)
+
+    // Hash the prompt
+    promptHash := hashPrompt(body)
+
+HashPrompt logic (internal/proxy/attribution.go, line 28):
+```go
+hash := sha256.Sum256(body)
+// body = {"model":"gpt-4o-mini","messages":[...]}
+// SHA256 = 7d8f9e2a1b3c4d5e6f7g8h9i0j1k2l3m4n5o6p7q8r9s0t1u2v3w4x5y6z7a8b9
+// Truncate to 16 bytes (32 hex chars)
+return "7d8f9e2a1b3c4d5e"
+```
+
+Result: promptHash = "7d8f9e2a1b3c4d5e"
+
+------------------------------------------------------------------------
+STEP 7: WRITE TO WAL (14:35:22.307 UTC, +184ms) ⚠️ CRITICAL ⚠️
+------------------------------------------------------------------------
+
+File: internal/proxy/handler.go, line 97
+
+    h.WAL.Write(wal.Record{
+        Project:      "acme-chatbot",
+        Provider:     "openai",
+        Model:        "gpt-4o-mini-2024-07-18",
+        PromptHash:   "7d8f9e2a1b3c4d5e",
+        InputTokens:  11,
+        OutputTokens: 7,
+        TotalTokens:  18,
+        Cost:         0.00000585,
+        LatencyMs:    180,
+        StatusCode:   200,
+        CacheHit:     false,
+        Stream:       false,
+    })
+
+WAL Write logic (internal/wal/writer.go, line 58):
+
+```go
+// 1. Set timestamp
+rec.Time = time.Now().UTC()  // 2026-05-21T14:35:22.307Z
+
+// 2. Marshal to JSON
+line, _ := json.Marshal(rec)
+// line = {"time":"2026-05-21T14:35:22.307Z","project":"acme-chatbot",...}
+
+// 3. Append newline (JSONL format)
+line = append(line, '\n')
+
+// 4. Lock mutex (thread-safety)
+w.mu.Lock()
+defer w.mu.Unlock()
+
+// 5. Ensure file is open
+w.ensureFile()
+// Current date: 2026-05-21
+// File path: /data/wal/wal-2026-05-21.jsonl
+// File is open ✓
+
+// 6. Write to file
+w.file.Write(line)
+// Appended 256 bytes to wal-2026-05-21.jsonl
+
+// 7. Increment pending counter
+w.pending++  // now pending = 1
+
+// 8. Check if we should fsync NOW
+if w.pending >= 50 {
+    w.file.Sync()  // Not reached (pending = 1 < 50)
+    w.pending = 0
+}
+```
+
+FILE CONTENTS NOW:
+/data/wal/wal-2026-05-21.jsonl:
+```jsonl
+{"time":"2026-05-21T14:35:22.307Z","project":"acme-chatbot","provider":"openai","model":"gpt-4o-mini-2024-07-18","prompt_hash":"7d8f9e2a1b3c4d5e","input_tokens":11,"output_tokens":7,"total_tokens":18,"cost":0.00000585,"latency_ms":180,"status_code":200,"cache_hit":false,"stream":false}
+```
+
+IMPORTANT: Data is in file buffer, NOT yet fsynced to disk!
+
+BACKGROUND GOROUTINE (running every 100ms):
+  - Next tick: 14:35:22.400 UTC (93ms from now)
+  - Will check: w.pending > 0? YES (pending = 1)
+  - Will call: w.file.Sync() ← FSYNC TO DISK
+  - Result: Data durably written to physical disk
+
+WAL write took: 0.4ms (JSON marshal + append to buffer)
+
+------------------------------------------------------------------------
+STEP 8: RETURN RESPONSE TO CLIENT (14:35:22.308 UTC, +185ms)
+------------------------------------------------------------------------
+
+File: internal/proxy/handler.go, line 113
+
+    // Copy response headers
+    copyHeaders(resp.Header, w.Header())
+    // Content-Type: application/json
+    // Other OpenAI headers...
+
+    // Write status code
+    w.WriteHeader(200)
+
+    // Write response body
+    w.Write(respBody)
+
+HTTP response sent to client:
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: 478
+
+{
+  "id": "chatcmpl-9b2f1g3h4j5k6l7m8n9o0p1q",
+  "object": "chat.completion",
+  "created": 1716298522,
+  "model": "gpt-4o-mini-2024-07-18",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "The capital of France is Paris."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 11,
+    "completion_tokens": 7,
+    "total_tokens": 18
+  }
+}
+```
+
+Client receives response, parses it:
+  response.choices[0].message.content = "The capital of France is Paris."
+
+The client has NO IDEA we were in the middle. The response is identical to
+calling OpenAI directly. Transparent proxy ✓
+
+Total latency from client's perspective: 185ms
+  - Without proxy (direct to OpenAI): ~180ms
+  - With proxy overhead: +5ms (2% increase)
+
+------------------------------------------------------------------------
+STEP 9: BACKGROUND FSYNC (14:35:22.400 UTC, +277ms)
+------------------------------------------------------------------------
+
+File: internal/wal/writer.go, line 123 (background goroutine)
+
+```go
+func (w *Writer) syncLoop() {
+    ticker := time.NewTicker(100 * time.Millisecond)
+    for {
+        select {
+        case <-ticker.C:  // ← FIRES NOW
+            w.mu.Lock()
+            if w.file != nil && w.pending > 0 {
+                w.file.Sync()  // ← FSYNC TO DISK
+                // Takes ~0.5ms on SSD
+                w.pending = 0
+            }
+            w.mu.Unlock()
+        }
+    }
+}
+```
+
+What Sync() does:
+  - Flushes file buffer to kernel
+  - Tells kernel: "Write this to physical disk NOW"
+  - Waits for disk controller to confirm write
+  - Returns when data is durable (survives power loss)
+
+After this completes:
+  - wal-2026-05-21.jsonl is on physical disk
+  - Even if server crashes, data survives ✓
+  - Reconciliation (Phase 2) will read this file and insert to Postgres
+
+------------------------------------------------------------------------
+STEP 10: PROMETHEUS METRICS UPDATED (14:35:22.308 UTC)
+------------------------------------------------------------------------
+
+File: cmd/proxy/main.go, line 55 (metricsMiddleware)
+
+After response is sent, middleware updates metrics:
+
+```go
+witness_http_requests_total{method="POST",status="200",provider="openai"} ← increment by 1
+witness_http_request_duration_seconds{method="POST",provider="openai"} ← record 0.185s
+witness_proxy_requests_total{project="acme-chatbot",provider="openai",model="gpt-4o-mini"} ← increment by 1
+witness_proxy_tokens_total{project="acme-chatbot",provider="openai",model="gpt-4o-mini",type="input"} ← add 11
+witness_proxy_tokens_total{project="acme-chatbot",provider="openai",model="gpt-4o-mini",type="output"} ← add 7
+witness_proxy_cost_total{project="acme-chatbot",provider="openai",model="gpt-4o-mini"} ← add 0.00000585
+```
+
+Prometheus scrapes /metrics every 15 seconds and records these values.
+Grafana queries Prometheus to show graphs (Phase 5).
+
+------------------------------------------------------------------------
+SUMMARY: COMPLETE TIMELINE
+------------------------------------------------------------------------
+
+14:35:22.123 UTC (+0ms)    Client sends request
+14:35:22.124 UTC (+1ms)    Chi router receives, runs middleware
+14:35:22.125 UTC (+2ms)    Proxy handler starts, looks up provider
+14:35:22.126 UTC (+3ms)    Reads body, resolves project, checks streaming
+14:35:22.127 UTC (+4ms)    Forwards request to OpenAI
+          ... (network call, OpenAI processing) ...
+14:35:22.305 UTC (+182ms)  OpenAI response received
+14:35:22.306 UTC (+183ms)  Extract usage, compute cost, hash prompt
+14:35:22.307 UTC (+184ms)  Write to WAL (appends to file buffer)
+14:35:22.308 UTC (+185ms)  Return response to client ✓
+14:35:22.400 UTC (+277ms)  Background goroutine fsyncs WAL to disk ✓
+
+WHAT THE CLIENT SEES:
+  - Sent request at 14:35:22.123
+  - Got response at 14:35:22.308
+  - Latency: 185ms (5ms more than direct OpenAI call)
+  - Response is identical to OpenAI's (transparent proxy)
+
+WHAT WE CAPTURED:
+  - Project: acme-chatbot
+  - Provider: openai
+  - Model: gpt-4o-mini-2024-07-18
+  - Prompt hash: 7d8f9e2a1b3c4d5e
+  - Tokens: 11 input, 7 output, 18 total
+  - Cost: $0.00000585
+  - Latency: 180ms
+  - Status: 200 (success)
+  - Written to: /data/wal/wal-2026-05-21.jsonl
+  - Fsynced to disk: YES (durable)
+
+------------------------------------------------------------------------
+WHAT HAPPENS NEXT (PHASE 2)
+------------------------------------------------------------------------
+
+Later, the WAL drain worker (separate binary) will:
+
+1. Read /data/wal/wal-2026-05-21.jsonl line by line
+2. Parse each JSONL record
+3. Batch 100 records together
+4. Execute Postgres transaction:
+   ```sql
+   BEGIN;
+
+   INSERT INTO requests (
+     project_id,
+     provider,
+     model,
+     prompt_hash,
+     input_tokens,
+     output_tokens,
+     total_tokens,
+     cost,
+     latency_ms,
+     status_code,
+     cache_hit,
+     stream,
+     created_at
+   ) VALUES (
+     (SELECT id FROM projects WHERE slug='acme-chatbot'),
+     'openai',
+     'gpt-4o-mini-2024-07-18',
+     '7d8f9e2a1b3c4d5e',
+     11,
+     7,
+     18,
+     0.00000585,
+     180,
+     200,
+     false,
+     false,
+     '2026-05-21T14:35:22.307Z'
+   );
+
+   INSERT INTO prompts (project_id, prompt_hash, total_calls, total_cost, ...)
+   VALUES (...)
+   ON CONFLICT (project_id, prompt_hash) DO UPDATE
+     SET total_calls = prompts.total_calls + 1,
+         total_cost = prompts.total_cost + 0.00000585,
+         last_seen = NOW();
+
+   COMMIT;
+   ```
+
+5. Update offset file: wal-offset.json
+   ```json
+   {"wal-2026-05-21.jsonl": 257}
+   ```
+   (Next time, start reading from byte 257)
+
+6. Repeat every 1 second
+
+Now Postgres has queryable data:
+  - "Show me all requests for acme-chatbot today"
+  - "What's the total cost for acme-chatbot this month?"
+  - "Which prompts are called most frequently?"
+
+------------------------------------------------------------------------
+THE MAGIC: WHAT MAKES THIS RELIABLE
+------------------------------------------------------------------------
+
+❶ WAL is LOCAL DISK (not network)
+  → Can't fail due to network issues
+  → Append is <1ms (faster than Postgres INSERT)
+
+❷ FSYNC BEFORE RESPONSE RETURN
+  → If we crash AFTER sending response, data is already on disk
+  → If we crash BEFORE sending response, client retries (idempotent)
+
+❸ BATCHED FSYNC
+  → 50 records OR 100ms, whichever comes first
+  → Amortizes fsync cost over many writes
+  → 0.5ms / 50 records = 0.01ms per record
+
+❹ JSONL FORMAT
+  → One record per line
+  → Partial reads are safe (just skip incomplete line)
+  → No need to parse entire file
+
+❺ DAILY ROTATION
+  → One file per day
+  → Old files don't grow unbounded
+  → Easy to archive to S3 after 7 days
+
+❻ IDEMPOTENT DRAIN
+  → Drain worker can restart mid-batch (transaction rollback)
+  → Offset file tracks progress
+  → Re-reading same records is safe (INSERT is idempotent by timestamp)
+
+------------------------------------------------------------------------
+WHY THIS IS BETTER THAN "JUST USE POSTGRES"
+------------------------------------------------------------------------
+
+NAIVE APPROACH (direct Postgres write):
+```
+Request → OpenAI → Extract usage → INSERT INTO postgres → Return response
+                                    ↑
+                                  Takes 5-10ms
+                                  Can fail (DB down)
+                                  Blocks request
+```
+
+At 1000 req/s:
+  - Postgres handles 1000 INSERT/s (doable but pushing limits)
+  - Each request waits 5-10ms for INSERT
+  - If Postgres goes down, ALL requests fail (not just tracking)
+
+OUR APPROACH (WAL + async drain):
+```
+Request → OpenAI → Extract usage → Append to WAL (0.5ms) → Return response
+                                    ↑
+                                  Fast (local disk)
+                                  Can't fail
+                                  Doesn't block
+
+(Background worker, separate process)
+WAL → Batch 100 records → Single Postgres transaction → Done
+```
+
+At 1000 req/s:
+  - WAL handles 1000 appends/s (trivial)
+  - Each request waits 0.5ms for WAL write
+  - Postgres handles 10 transactions/s (100 records each) ← easy
+  - If Postgres goes down, requests still work (WAL buffers)
+
+RESULT: 10x faster, 100x more reliable.
+
+================================================================================
 PHASE 0: THE SKELETON (DAYS 1-2)
 ================================================================================
 
