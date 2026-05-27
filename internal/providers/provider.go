@@ -10,6 +10,12 @@ type Usage struct {
 	Model        string `json:"model"`
 }
 
+// ToolCall represents a single tool invocation extracted from an LLM response.
+type ToolCall struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
 // Provider defines how to proxy to a specific LLM API.
 type Provider struct {
 	Name       string
@@ -23,6 +29,10 @@ type Provider struct {
 	IsStreamRequest func(body []byte) bool
 	// PrepareStreamBody modifies the request body to ensure usage is included in stream.
 	PrepareStreamBody func(body []byte) ([]byte, error)
+	// ExtractToolCalls parses tool invocations from a non-streaming response.
+	ExtractToolCalls func(body []byte) []ToolCall
+	// ExtractStreamToolCalls parses tool invocations from accumulated SSE events.
+	ExtractStreamToolCalls func(events []SSEEvent) []ToolCall
 }
 
 // SSEEvent represents a single Server-Sent Event.
