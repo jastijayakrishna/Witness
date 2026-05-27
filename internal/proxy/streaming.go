@@ -12,15 +12,22 @@ import (
 
 	"github.com/rs/zerolog/log"
 
+	"github.com/witness-proxy/witness-proxy/internal/attribution"
 	"github.com/witness-proxy/witness-proxy/internal/providers"
 	"github.com/witness-proxy/witness-proxy/internal/wal"
 )
 
-func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, provider *providers.Provider, body []byte, project string) {
+func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, provider *providers.Provider, body []byte, project, sessionID string) {
 	start := time.Now()
 
-	// Prepare stream body (e.g., inject stream_options for OpenAI)
+	// Before modifying the body, check if the client already requested
+	// include_usage. If they did, we must NOT suppress the usage chunk
+	// later — they expect it for their own accounting.
+	weInjectedUsage := false
 	if provider.PrepareStreamBody != nil {
+		if provider.Name == "openai" {
+			weInjectedUsage = !clientHasIncludeUsage(body)
+		}
 		modified, err := provider.PrepareStreamBody(body)
 		if err != nil {
 			log.Error().Err(err).Msg("failed to prepare stream body")
@@ -78,14 +85,16 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, provider 
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(resp.StatusCode)
 
-	// Accumulate SSE events while streaming to client
-	var events []providers.SSEEvent
+	// Only accumulate events needed for usage + tool_call extraction — NOT every
+	// content delta. Long agent streams can produce thousands of content chunks;
+	// storing them all is an OOM risk under concurrency.
+	var usageEvents []providers.SSEEvent
+	var toolCallEvents []providers.SSEEvent
 	scanner := bufio.NewScanner(resp.Body)
 	// Increase buffer for large SSE chunks
 	scanner.Buffer(make([]byte, 0, 256*1024), 1024*1024)
 
 	var currentEvent providers.SSEEvent
-	isUsageChunk := false
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -93,17 +102,25 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, provider 
 		if line == "" {
 			// Empty line = end of event
 			if currentEvent.Data != "" || currentEvent.Event != "" {
-				events = append(events, currentEvent)
-
-				// For OpenAI: check if this is the final usage-only chunk
-				// (has usage but no content delta). Don't forward it.
-				isUsageChunk = false
-				if provider.Name == "openai" && currentEvent.Data != "" && currentEvent.Data != "[DONE]" {
-					isUsageChunk = isOpenAIUsageOnlyChunk(currentEvent.Data)
+				// Decide whether to keep this event for usage extraction
+				if isUsageRelevantEvent(provider.Name, currentEvent, len(usageEvents) == 0) {
+					usageEvents = append(usageEvents, currentEvent)
 				}
 
-				if !isUsageChunk {
-					// Forward event to client
+				// Keep tool_call-relevant events for tool extraction
+				if isToolCallRelevantEvent(provider.Name, currentEvent) {
+					toolCallEvents = append(toolCallEvents, currentEvent)
+				}
+
+				// Decide whether to forward this event to the client.
+				// Suppress usage-only chunks ONLY when we injected include_usage.
+				suppress := false
+				if weInjectedUsage && provider.Name == "openai" &&
+					currentEvent.Data != "" && currentEvent.Data != "[DONE]" {
+					suppress = isOpenAIUsageOnlyChunk(currentEvent.Data)
+				}
+
+				if !suppress {
 					writeSSEEvent(w, currentEvent)
 					flusher.Flush()
 				}
@@ -136,12 +153,19 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, provider 
 
 	// Handle any remaining event
 	if currentEvent.Data != "" || currentEvent.Event != "" {
-		events = append(events, currentEvent)
-		isUsageChunk = false
-		if provider.Name == "openai" && currentEvent.Data != "" && currentEvent.Data != "[DONE]" {
-			isUsageChunk = isOpenAIUsageOnlyChunk(currentEvent.Data)
+		if isUsageRelevantEvent(provider.Name, currentEvent, len(usageEvents) == 0) {
+			usageEvents = append(usageEvents, currentEvent)
 		}
-		if !isUsageChunk {
+		if isToolCallRelevantEvent(provider.Name, currentEvent) {
+			toolCallEvents = append(toolCallEvents, currentEvent)
+		}
+
+		suppress := false
+		if weInjectedUsage && provider.Name == "openai" &&
+			currentEvent.Data != "" && currentEvent.Data != "[DONE]" {
+			suppress = isOpenAIUsageOnlyChunk(currentEvent.Data)
+		}
+		if !suppress {
 			writeSSEEvent(w, currentEvent)
 			flusher.Flush()
 		}
@@ -149,36 +173,122 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, provider 
 
 	latency := time.Since(start)
 
-	// Extract usage from accumulated events
+	// Extract usage from the (small) set of usage-relevant events
 	var usage providers.Usage
 	if provider.ExtractStreamUsage != nil {
-		usage, err = provider.ExtractStreamUsage(events)
+		usage, err = provider.ExtractStreamUsage(usageEvents)
 		if err != nil {
 			log.Warn().Err(err).Str("provider", provider.Name).Msg("failed to extract stream usage")
 		}
 	}
 
+	// Extract tool calls from accumulated tool_call events
+	var toolCalls []providers.ToolCall
+	if provider.ExtractStreamToolCalls != nil {
+		toolCalls = provider.ExtractStreamToolCalls(toolCallEvents)
+	}
+
 	cost := providers.ComputeCost(usage.Model, usage.InputTokens, usage.OutputTokens)
 	promptHash := hashPrompt(body)
 
+	// Compute tool signature + args fingerprint (Phase 2)
+	toolSig, argsFP := computeToolFingerprints(toolCalls)
+
+	// Log normalization ratio per project (Phase 2)
+	ratio := attribution.NormalizationRatio(string(body))
+	normalizationRatio.WithLabelValues(project).Set(ratio)
+	if ratio < 0.5 {
+		log.Warn().
+			Str("project", project).
+			Float64("ratio", ratio).
+			Msg("low normalization ratio: project feeds mostly dynamic data, dedup accuracy is lower")
+	}
+
+	// Loop detection (shadow mode — observe only, no enforcement yet)
+	loopSignals, loopConf, loopAct := h.observeLoop(r.Context(), project, sessionID, toolCalls, usage, cost)
+
 	// Write WAL BEFORE client connection closes
 	walErr := h.WAL.Write(wal.Record{
-		Project:      project,
-		Provider:     provider.Name,
-		Model:        usage.Model,
-		PromptHash:   promptHash,
-		InputTokens:  usage.InputTokens,
-		OutputTokens: usage.OutputTokens,
-		TotalTokens:  usage.TotalTokens,
-		Cost:         cost,
-		LatencyMs:    latency.Milliseconds(),
-		StatusCode:   resp.StatusCode,
-		CacheHit:     false,
-		Stream:       true,
+		Project:          project,
+		Provider:         provider.Name,
+		Model:            usage.Model,
+		PromptHash:       promptHash,
+		InputTokens:      usage.InputTokens,
+		OutputTokens:     usage.OutputTokens,
+		TotalTokens:      usage.TotalTokens,
+		Cost:             cost,
+		LatencyMs:        latency.Milliseconds(),
+		StatusCode:       resp.StatusCode,
+		CacheHit:         false,
+		Stream:           true,
+		SessionID:        sessionID,
+		ToolSignature:    toolSig,
+		ArgsFingerprint:  argsFP,
+		LoopSignalsFired: loopSignals,
+		LoopConfidence:   loopConf,
+		LoopAction:       loopAct,
 	})
 	if walErr != nil {
-		log.Error().Err(walErr).Msg("failed to write WAL for stream")
+		walWriteFailures.Inc()
+		log.Error().Err(walErr).Msg("failed to write WAL for stream — reconciliation gap")
 	}
+}
+
+// isUsageRelevantEvent returns true if this event should be kept for usage
+// extraction. Content delta events are forwarded to the client but NOT stored,
+// keeping memory bounded regardless of stream length.
+func isUsageRelevantEvent(providerName string, ev providers.SSEEvent, isFirst bool) bool {
+	switch providerName {
+	case "openai":
+		// Keep first event (model name fallback) + any event with real usage data.
+		if isFirst {
+			return true
+		}
+		if ev.Data == "" || ev.Data == "[DONE]" {
+			return false
+		}
+		return isOpenAIUsageOnlyChunk(ev.Data)
+
+	case "anthropic":
+		// Only message_start (input tokens + model) and message_delta (output tokens).
+		return ev.Event == "message_start" || ev.Event == "message_delta"
+
+	default:
+		// Unknown provider: keep all for safety.
+		return true
+	}
+}
+
+// isToolCallRelevantEvent returns true if this event may contain tool call data.
+func isToolCallRelevantEvent(providerName string, ev providers.SSEEvent) bool {
+	if ev.Data == "" || ev.Data == "[DONE]" {
+		return false
+	}
+	switch providerName {
+	case "openai":
+		// OpenAI tool_call deltas appear in choices[].delta.tool_calls
+		return strings.Contains(ev.Data, "tool_calls")
+	case "anthropic":
+		// Anthropic tool_use arrives via content_block_start and content_block_delta
+		return ev.Event == "content_block_start" || ev.Event == "content_block_delta"
+	default:
+		return false
+	}
+}
+
+// clientHasIncludeUsage checks if the client's original request body already
+// has stream_options.include_usage set to true. If so, we must not suppress
+// the usage chunk — the client expects it for their own accounting.
+func clientHasIncludeUsage(body []byte) bool {
+	var req struct {
+		StreamOptions *struct {
+			IncludeUsage bool `json:"include_usage"`
+		} `json:"stream_options"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return false
+	}
+	return req.StreamOptions != nil && req.StreamOptions.IncludeUsage
 }
 
 // writeSSEEvent writes a single SSE event to the writer.
@@ -197,7 +307,7 @@ func writeSSEEvent(w io.Writer, ev providers.SSEEvent) {
 
 // isOpenAIUsageOnlyChunk checks if an OpenAI streaming chunk contains usage
 // data but no content delta — these are the injected usage chunks that should
-// NOT be forwarded to the client.
+// NOT be forwarded to the client (when we injected include_usage).
 func isOpenAIUsageOnlyChunk(data string) bool {
 	var chunk struct {
 		Usage   *json.RawMessage `json:"usage"`
