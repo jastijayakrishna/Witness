@@ -6,7 +6,7 @@ Open-source LLM cost proxy with usage tracking, budget enforcement, and Slack re
 
 - **Multi-provider support**: OpenAI, Anthropic (Gemini + Cohere in Phase 5)
 - **Streaming & non-streaming**: Full SSE streaming support with usage capture
-- **Write-ahead log (WAL)**: Durable usage tracking with batched fsync (every 50 records or 100ms)
+- **Write-ahead log (WAL)**: Durable usage tracking with configurable fsync (batch mode: every 50 records or 100ms; sync mode: per-request fsync)
 - **Cost calculation**: Real-time cost tracking with hardcoded per-token pricing
 - **Attribution**: Project resolution via `X-Project` header or SHA256(Authorization) fallback
 - **Health & metrics**: `/healthz` endpoint and Prometheus `/metrics`
@@ -114,10 +114,10 @@ Client → Proxy (port 8080)
           ├─→ Forward to OpenAI/Anthropic
           ├─→ Extract usage from response
           ├─→ Compute cost from hardcoded pricing
-          ├─→ Write to WAL (fsync before return)
+          ├─→ Write to WAL (configurable: batch or per-request fsync)
           └─→ Return response to client
 
-WAL → data/wal/wal-YYYY-MM-DD.jsonl (append-only, fsynced)
+WAL → data/wal/wal-YYYY-MM-DD.jsonl (append-only, fsynced (batch or sync mode))
 ```
 
 ## Configuration
@@ -138,6 +138,7 @@ WITNESS_REDIS_PORT=6379
 WITNESS_REDIS_PASSWORD=
 WITNESS_REDIS_DB=0
 WITNESS_WAL_DIR=data/wal
+WITNESS_WAL_SYNC_MODE=batch   # "batch" (default) or "sync" (fsync every write)
 ```
 
 Or use `configs/proxy.yaml`:
@@ -160,6 +161,10 @@ redis:
   port: 6379
   password: ""
   db: 0
+
+wal:
+  dir: "data/wal"
+  sync_mode: "batch"   # "batch" (default) or "sync" (fsync every write)
 ```
 
 ## Database Schema
