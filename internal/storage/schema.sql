@@ -20,23 +20,6 @@ CREATE TABLE IF NOT EXISTS api_keys (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS requests (
-    id              BIGSERIAL PRIMARY KEY,
-    project_id      BIGINT REFERENCES projects(id),
-    provider        TEXT NOT NULL,
-    model           TEXT NOT NULL,
-    prompt_hash     TEXT NOT NULL,
-    input_tokens    INT NOT NULL DEFAULT 0,
-    output_tokens   INT NOT NULL DEFAULT 0,
-    total_tokens    INT NOT NULL DEFAULT 0,
-    cost            NUMERIC(12, 8) NOT NULL DEFAULT 0,
-    latency_ms      INT NOT NULL DEFAULT 0,
-    status_code     INT NOT NULL DEFAULT 0,
-    cache_hit       BOOLEAN NOT NULL DEFAULT FALSE,
-    stream          BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
 CREATE TABLE IF NOT EXISTS prompts (
     id              BIGSERIAL PRIMARY KEY,
     project_id      BIGINT REFERENCES projects(id),
@@ -72,9 +55,39 @@ CREATE TABLE IF NOT EXISTS anomalies (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Indexes (will be created concurrently in Phase 2, defined here for reference)
-CREATE INDEX IF NOT EXISTS idx_requests_project_created ON requests (project_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_requests_prompt_hash ON requests (prompt_hash);
-CREATE INDEX IF NOT EXISTS idx_requests_provider_model ON requests (provider, model);
+-- Phase 2: WAL records table (drained from WAL files)
+CREATE TABLE IF NOT EXISTS wal_records (
+    id              BIGSERIAL PRIMARY KEY,
+    ulid            TEXT NOT NULL DEFAULT '',
+    time            TIMESTAMPTZ NOT NULL,
+    project         TEXT NOT NULL,
+    provider        TEXT NOT NULL,
+    model           TEXT NOT NULL,
+    prompt_hash     TEXT NOT NULL,
+    input_tokens    INT NOT NULL DEFAULT 0,
+    output_tokens   INT NOT NULL DEFAULT 0,
+    total_tokens    INT NOT NULL DEFAULT 0,
+    cost            NUMERIC(12, 8) NOT NULL DEFAULT 0,
+    latency_ms      BIGINT NOT NULL DEFAULT 0,
+    status_code     INT NOT NULL DEFAULT 0,
+    cache_hit       BOOLEAN NOT NULL DEFAULT FALSE,
+    stream          BOOLEAN NOT NULL DEFAULT FALSE,
+    session_id      TEXT NOT NULL DEFAULT '',
+    tool_signature  TEXT NOT NULL DEFAULT '',
+    args_fingerprint TEXT NOT NULL DEFAULT '',
+    loop_signals_fired TEXT NOT NULL DEFAULT '',
+    loop_confidence NUMERIC(5,4) NOT NULL DEFAULT 0,
+    loop_action     TEXT NOT NULL DEFAULT '',
+    prev_hash       TEXT NOT NULL,
+    record_hash     TEXT NOT NULL UNIQUE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Indexes
 CREATE INDEX IF NOT EXISTS idx_prompts_project_hash ON prompts (project_id, prompt_hash);
 CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys (key_hash);
+
+-- Phase 2: WAL records indexes for reconciliation queries
+CREATE INDEX IF NOT EXISTS idx_wal_records_time ON wal_records (time);
+CREATE INDEX IF NOT EXISTS idx_wal_records_project ON wal_records (project, time);
+CREATE INDEX IF NOT EXISTS idx_wal_records_hash ON wal_records (record_hash);
