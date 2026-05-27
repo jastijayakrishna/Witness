@@ -19,6 +19,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/witness-proxy/witness-proxy/internal/config"
+	"github.com/witness-proxy/witness-proxy/internal/loop"
 	_ "github.com/witness-proxy/witness-proxy/internal/providers" // register providers via init()
 	"github.com/witness-proxy/witness-proxy/internal/proxy"
 	"github.com/witness-proxy/witness-proxy/internal/storage"
@@ -102,19 +103,31 @@ func main() {
 	log.Info().Msg("redis connected")
 
 	// WAL writer
-	walDir := os.Getenv("WITNESS_WAL_DIR")
-	if walDir == "" {
-		walDir = "data/wal"
-	}
-	walWriter, err := wal.NewWriter(walDir)
+	walWriter, err := wal.NewWriter(cfg.WAL.Dir, cfg.WAL.SyncMode)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to create WAL writer")
 	}
 	defer walWriter.Close()
-	log.Info().Str("dir", walDir).Msg("WAL writer initialized")
+	log.Info().Str("dir", cfg.WAL.Dir).Str("sync_mode", cfg.WAL.SyncMode).Msg("WAL writer initialized")
+
+	// Loop detection
+	var loopStore *loop.StateStore
+	if cfg.LoopDetection.Enabled {
+		loopStore = loop.NewStateStore(rdb)
+		log.Info().Str("action", cfg.LoopDetection.Action).Msg("loop detection enabled")
+	}
+	loopCfg := loop.Config{
+		Action:                 cfg.LoopDetection.Action,
+		MaxRepeated:            cfg.LoopDetection.MaxRepeated,
+		VelocityAccelRatio:     cfg.LoopDetection.VelocityAccelRatio,
+		VelocityWindowMs:       cfg.LoopDetection.VelocityWindowMs,
+		WarnConfidence:         cfg.LoopDetection.WarnConfidence,
+		BlockConfidence:        cfg.LoopDetection.BlockConfidence,
+		RequireSessionForBlock: cfg.LoopDetection.RequireSessionForBlock,
+	}
 
 	// Proxy handler
-	proxyHandler := proxy.NewHandler(walWriter)
+	proxyHandler := proxy.NewHandler(walWriter, loopStore, loopCfg)
 
 	// Router
 	r := chi.NewRouter()
