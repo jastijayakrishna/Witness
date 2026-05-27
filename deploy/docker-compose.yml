@@ -8,7 +8,7 @@ services:
       POSTGRES_PASSWORD: witness
       POSTGRES_DB: witness
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -20,7 +20,7 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - "6380:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -49,6 +49,27 @@ services:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+    volumes:
+      - ../configs:/app/configs:ro
+      - waldata:/data/wal
+
+  waldrain:
+    build:
+      context: ..
+      dockerfile: Dockerfile.waldrain
+    ports:
+      - "9090:9090"
+    environment:
+      WITNESS_POSTGRES_HOST: "postgres"
+      WITNESS_POSTGRES_PORT: "5432"
+      WITNESS_POSTGRES_USER: "witness"
+      WITNESS_POSTGRES_PASSWORD: "witness"
+      WITNESS_POSTGRES_DBNAME: "witness"
+      WITNESS_POSTGRES_SSLMODE: "disable"
+      WITNESS_WAL_DIR: "/data/wal"
+    depends_on:
+      postgres:
         condition: service_healthy
     volumes:
       - ../configs:/app/configs:ro
