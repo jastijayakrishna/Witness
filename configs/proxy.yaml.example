@@ -15,3 +15,17 @@ redis:
   port: 6379
   password: ""
   db: 0
+
+wal:
+  dir: "data/wal"
+  sync_mode: "batch"  # "batch" (default, ~100ms durability window) or "sync" (fsync per write)
+
+loop_detection:
+  enabled: true
+  action: "shadow"             # "shadow" (default) → "warn" → "block". Promote after shadow report looks right.
+  max_repeated: 3
+  velocity_accel_ratio: 1.5
+  velocity_window_ms: 300000   # 5 minutes
+  warn_confidence: 0.40
+  block_confidence: 0.70
+  require_session_for_block: true
