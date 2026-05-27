@@ -13,6 +13,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
+
+	"github.com/witness-proxy/witness-proxy/internal/loop"
 	"github.com/witness-proxy/witness-proxy/internal/providers"
 	"github.com/witness-proxy/witness-proxy/internal/wal"
 )
@@ -20,13 +24,13 @@ import (
 func newTestHandler(t *testing.T) (*Handler, string) {
 	t.Helper()
 	dir := t.TempDir()
-	w, err := wal.NewWriter(dir)
+	w, err := wal.NewWriter(dir, "batch")
 	if err != nil {
 		t.Fatalf("new wal writer: %v", err)
 	}
 	t.Cleanup(func() { w.Close() })
 
-	h := NewHandler(w)
+	h := NewHandler(w, nil, loop.DefaultConfig()) // nil LoopStore = detection disabled in tests
 	return h, dir
 }
 
@@ -216,6 +220,102 @@ func TestHandler_StreamOpenAI(t *testing.T) {
 	}
 	if !wr.Stream {
 		t.Error("wal stream should be true")
+	}
+}
+
+func TestHandler_StreamOpenAI_ClientRequestedUsage(t *testing.T) {
+	// When the client already set stream_options.include_usage = true,
+	// we must NOT suppress the usage chunk — they need it for their own accounting.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+
+		flusher := w.(http.Flusher)
+		chunks := []string{
+			"data: {\"id\":\"chatcmpl-s\",\"model\":\"gpt-4o-mini\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0}]}\n\n",
+			"data: {\"id\":\"chatcmpl-s\",\"model\":\"gpt-4o-mini\",\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\"}]}\n\n",
+			// Usage-only chunk — should be forwarded because client asked for it
+			"data: {\"id\":\"chatcmpl-s\",\"model\":\"gpt-4o-mini\",\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":1,\"total_tokens\":9}}\n\n",
+			"data: [DONE]\n\n",
+		}
+		for _, chunk := range chunks {
+			fmt.Fprint(w, chunk)
+			flusher.Flush()
+		}
+	}))
+	defer upstream.Close()
+
+	origTarget := providers.Registry["/openai"].Target
+	target, _ := url.Parse(upstream.URL)
+	providers.Registry["/openai"].Target = target
+	defer func() { providers.Registry["/openai"].Target = origTarget }()
+
+	handler, walDir := newTestHandler(t)
+
+	// Client already set include_usage — proxy should NOT suppress the usage chunk
+	body := `{"model":"gpt-4o-mini","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest("POST", "/openai/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer sk-test")
+	req.Header.Set("X-Project", "client-usage-test")
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	resp := rec.Result()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	respBody, _ := io.ReadAll(resp.Body)
+	respStr := string(respBody)
+
+	// The usage chunk MUST be forwarded because the client asked for it
+	if !strings.Contains(respStr, `"prompt_tokens"`) {
+		t.Error("usage chunk was suppressed but client requested include_usage — should have been forwarded")
+	}
+
+	// Content should also be forwarded
+	if !strings.Contains(respStr, `"Hi"`) {
+		t.Error("content chunk was not forwarded")
+	}
+
+	// Verify WAL still captured usage correctly
+	handler.WAL.Close()
+	time.Sleep(10 * time.Millisecond)
+
+	walRecords := readWALRecords(t, walDir)
+	if len(walRecords) != 1 {
+		t.Fatalf("expected 1 WAL record, got %d", len(walRecords))
+	}
+	wr := walRecords[0]
+	if wr.InputTokens != 8 {
+		t.Errorf("wal input_tokens = %d, want 8", wr.InputTokens)
+	}
+	if wr.OutputTokens != 1 {
+		t.Errorf("wal output_tokens = %d, want 1", wr.OutputTokens)
+	}
+}
+
+func TestClientHasIncludeUsage(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"no stream_options", `{"model":"gpt-4o","stream":true}`, false},
+		{"include_usage true", `{"model":"gpt-4o","stream":true,"stream_options":{"include_usage":true}}`, true},
+		{"include_usage false", `{"model":"gpt-4o","stream":true,"stream_options":{"include_usage":false}}`, false},
+		{"empty stream_options", `{"model":"gpt-4o","stream":true,"stream_options":{}}`, false},
+		{"invalid json", `{broken`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := clientHasIncludeUsage([]byte(tt.body))
+			if got != tt.want {
+				t.Errorf("clientHasIncludeUsage = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -508,6 +608,296 @@ func TestIsOpenAIUsageOnlyChunk(t *testing.T) {
 	}
 }
 
+// --- loop detection integration tests ---
+
+func newTestHandlerWithLoop(t *testing.T) (*Handler, string) {
+	t.Helper()
+	dir := t.TempDir()
+	w, err := wal.NewWriter(dir, "batch")
+	if err != nil {
+		t.Fatalf("new wal writer: %v", err)
+	}
+	t.Cleanup(func() { w.Close() })
+
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { rdb.Close() })
+	loopStore := loop.NewStateStore(rdb)
+
+	cfg := loop.DefaultConfig()
+	cfg.Action = "shadow" // shadow mode — observe only
+
+	h := NewHandler(w, loopStore, cfg)
+	return h, dir
+}
+
+func TestHandler_LoopDetection_PopulatesWALFields(t *testing.T) {
+	// A single request with a tool call should populate loop fields in WAL
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		fmt.Fprint(w, `{
+			"id": "chatcmpl-loop1",
+			"model": "gpt-4o-mini",
+			"choices": [{
+				"message": {
+					"role": "assistant",
+					"tool_calls": [{
+						"id": "call_1",
+						"type": "function",
+						"function": {"name": "bash", "arguments": "{\"cmd\":\"ls\"}"}
+					}]
+				},
+				"finish_reason": "tool_calls"
+			}],
+			"usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120}
+		}`)
+	}))
+	defer upstream.Close()
+
+	origTarget := providers.Registry["/openai"].Target
+	target, _ := url.Parse(upstream.URL)
+	providers.Registry["/openai"].Target = target
+	defer func() { providers.Registry["/openai"].Target = origTarget }()
+
+	handler, walDir := newTestHandlerWithLoop(t)
+
+	body := `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"run ls"}]}`
+	req := httptest.NewRequest("POST", "/openai/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer sk-test")
+	req.Header.Set("X-Project", "loop-test")
+	req.Header.Set("X-Session-ID", "sess-1")
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+
+	handler.WAL.Close()
+	time.Sleep(10 * time.Millisecond)
+
+	records := readWALRecords(t, walDir)
+	if len(records) != 1 {
+		t.Fatalf("expected 1 WAL record, got %d", len(records))
+	}
+
+	wr := records[0]
+	// First turn should have no signals (not enough history to detect a loop)
+	if wr.LoopSignalsFired != "" {
+		t.Errorf("first turn should have no signals, got %q", wr.LoopSignalsFired)
+	}
+	if wr.LoopConfidence != 0 {
+		t.Errorf("first turn confidence = %f, want 0", wr.LoopConfidence)
+	}
+	// Action should be "none" (effective = min(shadow, none) = none)
+	if wr.LoopAction != "" && wr.LoopAction != "none" {
+		t.Errorf("first turn action = %q, want empty or none", wr.LoopAction)
+	}
+}
+
+func TestHandler_LoopDetection_DetectsRepetition(t *testing.T) {
+	// Send multiple identical tool-call requests to trigger identical_repeat
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		fmt.Fprint(w, `{
+			"id": "chatcmpl-rep",
+			"model": "gpt-4o-mini",
+			"choices": [{
+				"message": {
+					"role": "assistant",
+					"tool_calls": [{
+						"id": "call_r",
+						"type": "function",
+						"function": {"name": "bash", "arguments": "{\"cmd\":\"ls\"}"}
+					}]
+				},
+				"finish_reason": "tool_calls"
+			}],
+			"usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120}
+		}`)
+	}))
+	defer upstream.Close()
+
+	origTarget := providers.Registry["/openai"].Target
+	target, _ := url.Parse(upstream.URL)
+	providers.Registry["/openai"].Target = target
+	defer func() { providers.Registry["/openai"].Target = origTarget }()
+
+	handler, walDir := newTestHandlerWithLoop(t)
+
+	body := `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"run ls again"}]}`
+
+	// Send 4 identical requests (MaxRepeated = 3, so 3+ fires identical_repeat)
+	for i := 0; i < 4; i++ {
+		req := httptest.NewRequest("POST", "/openai/v1/chat/completions", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer sk-test")
+		req.Header.Set("X-Project", "repeat-test")
+		req.Header.Set("X-Session-ID", "sess-repeat")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("request %d: status = %d", i, rec.Code)
+		}
+	}
+
+	handler.WAL.Close()
+	time.Sleep(10 * time.Millisecond)
+
+	records := readWALRecords(t, walDir)
+	if len(records) != 4 {
+		t.Fatalf("expected 4 WAL records, got %d", len(records))
+	}
+
+	// The last record (4th turn) should have identical_repeat signal
+	last := records[3]
+	if !strings.Contains(last.LoopSignalsFired, "identical_repeat") {
+		t.Errorf("4th turn signals = %q, want to contain 'identical_repeat'", last.LoopSignalsFired)
+	}
+	if last.LoopConfidence <= 0 {
+		t.Errorf("4th turn confidence = %f, want > 0", last.LoopConfidence)
+	}
+}
+
+func TestHandler_LoopDetection_FailsOpenOnRedisDown(t *testing.T) {
+	// When Redis is unreachable, loop detection must fail open:
+	// - request completes successfully
+	// - WAL is written (with empty loop fields)
+	// - no hang, no panic
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		fmt.Fprint(w, `{
+			"id": "chatcmpl-failopen",
+			"model": "gpt-4o-mini",
+			"choices": [{
+				"message": {
+					"role": "assistant",
+					"tool_calls": [{
+						"id": "call_fo",
+						"type": "function",
+						"function": {"name": "bash", "arguments": "{\"cmd\":\"ls\"}"}
+					}]
+				},
+				"finish_reason": "tool_calls"
+			}],
+			"usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120}
+		}`)
+	}))
+	defer upstream.Close()
+
+	origTarget := providers.Registry["/openai"].Target
+	target, _ := url.Parse(upstream.URL)
+	providers.Registry["/openai"].Target = target
+	defer func() { providers.Registry["/openai"].Target = origTarget }()
+
+	// Create handler with a Redis that we then shut down
+	dir := t.TempDir()
+	w, err := wal.NewWriter(dir, "batch")
+	if err != nil {
+		t.Fatalf("new wal writer: %v", err)
+	}
+	t.Cleanup(func() { w.Close() })
+
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { rdb.Close() })
+	loopStore := loop.NewStateStore(rdb)
+
+	cfg := loop.DefaultConfig()
+	cfg.Action = "shadow"
+	handler := NewHandler(w, loopStore, cfg)
+
+	// Kill Redis BEFORE sending the request
+	mr.Close()
+
+	body := `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"test"}]}`
+	req := httptest.NewRequest("POST", "/openai/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer sk-test")
+	req.Header.Set("X-Project", "failopen-test")
+	req.Header.Set("X-Session-ID", "sess-fail")
+
+	start := time.Now()
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	elapsed := time.Since(start)
+
+	// Request MUST succeed
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200 (fail-open)", rec.Code)
+	}
+
+	// Must complete quickly — the 5ms timeout per call means at most ~10ms added.
+	// Give 500ms headroom for slow CI but the point is it doesn't hang.
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("request took %v — Redis failure should not block the hot path", elapsed)
+	}
+
+	// WAL should still be written (with empty loop fields)
+	handler.WAL.Close()
+	time.Sleep(10 * time.Millisecond)
+
+	records := readWALRecords(t, dir)
+	if len(records) != 1 {
+		t.Fatalf("expected 1 WAL record, got %d", len(records))
+	}
+	wr := records[0]
+	if wr.LoopSignalsFired != "" {
+		t.Errorf("failed-open should have no signals, got %q", wr.LoopSignalsFired)
+	}
+}
+
+func TestHandler_LoopDetection_DisabledWithNilStore(t *testing.T) {
+	// When LoopStore is nil, loop fields should be empty
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		fmt.Fprint(w, `{
+			"id": "chatcmpl-no-loop",
+			"model": "gpt-4o-mini",
+			"choices": [{"message": {"content": "Hi"}, "finish_reason": "stop"}],
+			"usage": {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13}
+		}`)
+	}))
+	defer upstream.Close()
+
+	origTarget := providers.Registry["/openai"].Target
+	target, _ := url.Parse(upstream.URL)
+	providers.Registry["/openai"].Target = target
+	defer func() { providers.Registry["/openai"].Target = origTarget }()
+
+	handler, walDir := newTestHandler(t) // nil LoopStore
+
+	body := `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest("POST", "/openai/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer sk-test")
+	req.Header.Set("X-Project", "disabled-test")
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	handler.WAL.Close()
+	time.Sleep(10 * time.Millisecond)
+
+	records := readWALRecords(t, walDir)
+	if len(records) != 1 {
+		t.Fatalf("expected 1 WAL record, got %d", len(records))
+	}
+
+	wr := records[0]
+	if wr.LoopSignalsFired != "" {
+		t.Errorf("disabled detector should not fire signals, got %q", wr.LoopSignalsFired)
+	}
+	if wr.LoopConfidence != 0 {
+		t.Errorf("disabled detector confidence = %f, want 0", wr.LoopConfidence)
+	}
+	if wr.LoopAction != "" {
+		t.Errorf("disabled detector action = %q, want empty", wr.LoopAction)
+	}
+}
+
 // --- helpers ---
 
 func readWALRecords(t *testing.T, dir string) []wal.Record {
@@ -520,6 +910,10 @@ func readWALRecords(t *testing.T, dir string) []wal.Record {
 	var records []wal.Record
 	for _, entry := range entries {
 		if entry.IsDir() {
+			continue
+		}
+		// Skip non-WAL files (e.g., wal-chain-head.json, wal-offset.json)
+		if !strings.HasPrefix(entry.Name(), "wal-") || !strings.HasSuffix(entry.Name(), ".jsonl") {
 			continue
 		}
 		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
