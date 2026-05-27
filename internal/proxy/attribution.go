@@ -8,6 +8,7 @@ import (
 
 const (
 	headerProject       = "X-Project"
+	headerSession       = "X-Session-ID"
 	headerAuthorization = "Authorization"
 	defaultProject      = "unknown"
 )
@@ -23,4 +24,11 @@ func ResolveProject(r *http.Request) string {
 		return fmt.Sprintf("key:%x", hash[:16])
 	}
 	return defaultProject
+}
+
+// ResolveSession returns the X-Session-ID header value, or empty string.
+// Load-bearing for the loop detector's safety floor: the detector never
+// hard-stops (blocks) a request that has no session ID.
+func ResolveSession(r *http.Request) string {
+	return r.Header.Get(headerSession)
 }
