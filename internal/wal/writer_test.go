@@ -19,7 +19,7 @@ func tempDir(t *testing.T) string {
 
 func TestWriter_SingleWrite(t *testing.T) {
 	dir := tempDir(t)
-	w, err := NewWriter(dir)
+	w, err := NewWriter(dir, "batch")
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestWriter_SingleWrite(t *testing.T) {
 
 func TestWriter_MultipleWrites_JSONL(t *testing.T) {
 	dir := tempDir(t)
-	w, err := NewWriter(dir)
+	w, err := NewWriter(dir, "batch")
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
 	}
@@ -136,7 +136,7 @@ func TestWriter_MultipleWrites_JSONL(t *testing.T) {
 
 func TestWriter_ConcurrentWrites(t *testing.T) {
 	dir := tempDir(t)
-	w, err := NewWriter(dir)
+	w, err := NewWriter(dir, "batch")
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestWriter_ConcurrentWrites(t *testing.T) {
 
 func TestWriter_FileNaming(t *testing.T) {
 	dir := tempDir(t)
-	w, err := NewWriter(dir)
+	w, err := NewWriter(dir, "batch")
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
 	}
@@ -207,7 +207,7 @@ func TestWriter_FileNaming(t *testing.T) {
 
 func TestWriter_CloseFsyncs(t *testing.T) {
 	dir := tempDir(t)
-	w, err := NewWriter(dir)
+	w, err := NewWriter(dir, "batch")
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
 	}
@@ -241,7 +241,7 @@ func TestWriter_CloseFsyncs(t *testing.T) {
 
 func TestWriter_TimestampIsUTC(t *testing.T) {
 	dir := tempDir(t)
-	w, err := NewWriter(dir)
+	w, err := NewWriter(dir, "batch")
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
 	}
@@ -271,7 +271,7 @@ func TestWriter_TimestampIsUTC(t *testing.T) {
 
 func TestWriter_RecordSerializesAllFields(t *testing.T) {
 	dir := tempDir(t)
-	w, err := NewWriter(dir)
+	w, err := NewWriter(dir, "batch")
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
 	}
@@ -313,4 +313,67 @@ func TestWriter_RecordSerializesAllFields(t *testing.T) {
 			t.Errorf("missing field %q in WAL record JSON", field)
 		}
 	}
+}
+
+// TestWriter_SyncMode_Sync verifies that sync mode fsyncs on every write,
+// so a record is on disk immediately without waiting for Close or 100ms tick.
+func TestWriter_SyncMode_Sync(t *testing.T) {
+	dir := tempDir(t)
+	w, err := NewWriter(dir, "sync")
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	defer w.Close()
+
+	// Write a single record (below batch threshold of 50)
+	err = w.Write(Record{
+		Project:    "sync-test",
+		Provider:   "openai",
+		Model:      "gpt-4o-mini",
+		StatusCode: 200,
+	})
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	// In sync mode, record should be on disk immediately (fsynced).
+	// Read directly from disk without calling Close.
+	today := time.Now().UTC().Format("2006-01-02")
+	path := filepath.Join(dir, "wal-"+today+".jsonl")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	count := 0
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	for scanner.Scan() {
+		if scanner.Text() != "" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("expected 1 fsynced record in sync mode, got %d", count)
+	}
+}
+
+// TestWriter_SyncMode_Default verifies that empty or unknown sync mode
+// defaults to batch mode behavior.
+func TestWriter_SyncMode_Default(t *testing.T) {
+	dir := tempDir(t)
+
+	// Empty string should default to batch mode (no panic, no error)
+	w1, err := NewWriter(dir, "")
+	if err != nil {
+		t.Fatalf("NewWriter with empty sync_mode: %v", err)
+	}
+	w1.Close()
+
+	// Unknown string should also default to batch mode
+	dir2 := t.TempDir()
+	w2, err := NewWriter(dir2, "unknown-mode")
+	if err != nil {
+		t.Fatalf("NewWriter with unknown sync_mode: %v", err)
+	}
+	w2.Close()
 }
