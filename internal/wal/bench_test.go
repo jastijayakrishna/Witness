@@ -4,7 +4,7 @@ import "testing"
 
 func BenchmarkWALWrite(b *testing.B) {
 	dir := b.TempDir()
-	w, err := NewWriter(dir)
+	w, err := NewWriter(dir, "batch")
 	if err != nil {
 		b.Fatalf("NewWriter: %v", err)
 	}
@@ -36,7 +36,7 @@ func BenchmarkWALWrite(b *testing.B) {
 
 func BenchmarkWALWrite_Parallel(b *testing.B) {
 	dir := b.TempDir()
-	w, err := NewWriter(dir)
+	w, err := NewWriter(dir, "batch")
 	if err != nil {
 		b.Fatalf("NewWriter: %v", err)
 	}
