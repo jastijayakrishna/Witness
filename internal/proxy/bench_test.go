@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/witness-proxy/witness-proxy/internal/loop"
 	"github.com/witness-proxy/witness-proxy/internal/providers"
 	"github.com/witness-proxy/witness-proxy/internal/wal"
 )
@@ -26,9 +27,9 @@ func BenchmarkHandler_NonStream(b *testing.B) {
 	defer func() { providers.Registry["/openai"].Target = origTarget }()
 
 	dir := b.TempDir()
-	walWriter, _ := wal.NewWriter(dir)
+	walWriter, _ := wal.NewWriter(dir, "batch")
 	defer walWriter.Close()
-	handler := NewHandler(walWriter)
+	handler := NewHandler(walWriter, nil, loop.DefaultConfig())
 
 	body := `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}`
 
@@ -61,9 +62,9 @@ func BenchmarkHandler_Stream(b *testing.B) {
 	defer func() { providers.Registry["/openai"].Target = origTarget }()
 
 	dir := b.TempDir()
-	walWriter, _ := wal.NewWriter(dir)
+	walWriter, _ := wal.NewWriter(dir, "batch")
 	defer walWriter.Close()
-	handler := NewHandler(walWriter)
+	handler := NewHandler(walWriter, nil, loop.DefaultConfig())
 
 	body := `{"model":"gpt-4o-mini","stream":true,"messages":[{"role":"user","content":"hi"}]}`
 
