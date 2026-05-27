@@ -17,7 +17,7 @@ import (
 // Simulates a clean shutdown recovery scenario.
 func TestDurability_WriteCloseReopen(t *testing.T) {
 	dir := t.TempDir()
-	w, err := NewWriter(dir)
+	w, err := NewWriter(dir, "batch")
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestDurability_WriteCloseReopen(t *testing.T) {
 // and verifies zero records are lost.
 func TestDurability_HighConcurrency(t *testing.T) {
 	dir := t.TempDir()
-	w, err := NewWriter(dir)
+	w, err := NewWriter(dir, "batch")
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestDurability_HighConcurrency(t *testing.T) {
 // an fsync has occurred (records are durable even without close).
 func TestDurability_BatchFsyncThreshold(t *testing.T) {
 	dir := t.TempDir()
-	w, err := NewWriter(dir)
+	w, err := NewWriter(dir, "batch")
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestDurability_AppendAfterReopen(t *testing.T) {
 	dir := t.TempDir()
 
 	// First writer: write 10 records
-	w1, err := NewWriter(dir)
+	w1, err := NewWriter(dir, "batch")
 	if err != nil {
 		t.Fatalf("NewWriter 1: %v", err)
 	}
@@ -196,7 +196,7 @@ func TestDurability_AppendAfterReopen(t *testing.T) {
 	w1.Close()
 
 	// Second writer: write 10 more records
-	w2, err := NewWriter(dir)
+	w2, err := NewWriter(dir, "batch")
 	if err != nil {
 		t.Fatalf("NewWriter 2: %v", err)
 	}
@@ -228,7 +228,7 @@ func TestDurability_AppendAfterReopen(t *testing.T) {
 // parseable as valid JSON (the whole point of JSONL format).
 func TestDurability_JSONLIntegrity(t *testing.T) {
 	dir := t.TempDir()
-	w, err := NewWriter(dir)
+	w, err := NewWriter(dir, "batch")
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
 	}
@@ -292,6 +292,10 @@ func readAllRecords(t *testing.T, dir string) []Record {
 	var records []Record
 	for _, entry := range entries {
 		if entry.IsDir() {
+			continue
+		}
+		// Skip non-WAL files (e.g., wal-chain-head.json, wal-offset.json)
+		if !strings.HasPrefix(entry.Name(), "wal-") || !strings.HasSuffix(entry.Name(), ".jsonl") {
 			continue
 		}
 		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
