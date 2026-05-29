@@ -72,7 +72,19 @@ func main() {
 
 	// Postgres
 	log.Info().Str("dsn", cfg.Postgres.DSN()).Msg("connecting to postgres")
-	pgPool, err := pgxpool.New(ctx, cfg.Postgres.DSN())
+	poolCfg, err := pgxpool.ParseConfig(cfg.Postgres.DSN())
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to parse postgres dsn")
+	}
+	poolCfg.MaxConns = 20
+	poolCfg.MinConns = 2
+	poolCfg.MaxConnLifetime = time.Hour
+	poolCfg.MaxConnIdleTime = 30 * time.Minute
+	poolCfg.HealthCheckPeriod = time.Minute
+	poolCfg.ConnConfig.RuntimeParams["statement_timeout"] = "30000"
+	poolCfg.ConnConfig.RuntimeParams["idle_in_transaction_session_timeout"] = "60000"
+
+	pgPool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to connect to postgres")
 	}
@@ -151,18 +163,26 @@ func main() {
 
 	r.Handle("/metrics", promhttp.Handler())
 
-	// Mount proxy routes for each provider
+	// Mount proxy routes for each provider. Concurrency is bounded by the
+	// Handler's inflight semaphore (with metrics + 503 shedding), so no
+	// chi-level throttle is needed.
 	r.Handle("/openai/*", proxyHandler)
 	r.Handle("/anthropic/*", proxyHandler)
 
 	// Server
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
 	srv := &http.Server{
-		Addr:         addr,
-		Handler:      r,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 120 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		Addr:    addr,
+		Handler: r,
+		// WriteTimeout MUST be 0 for a streaming proxy — a fixed value severs
+		// long token streams mid-flight. Exposure is bounded instead by
+		// ReadHeaderTimeout (client-side slowloris) and the Transport's
+		// ResponseHeaderTimeout (hung upstream).
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      0,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
 	// Graceful shutdown
