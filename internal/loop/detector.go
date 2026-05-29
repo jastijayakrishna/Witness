@@ -100,10 +100,16 @@ const (
 
 // Decision is fully explainable: which signals fired, the confidence, the ceiling,
 // and a one-line human reason. Everything a Slack alert or a 429 body needs.
+// DetectorVersion is stamped on every Decision and WAL record so future
+// replay and training pipelines know which algorithm made which verdict.
+// Bump this string whenever detector logic changes — never omit it.
+const DetectorVersion = "1.1.0"
+
 type Decision struct {
-	SignalsFired  []string // e.g. ["identical_repeat","cost_velocity_accel"]
-	Confidence    float64  // 0..1
-	ActionCeiling Action   // the strongest action the evidence permits
+	SignalsFired    []string // e.g. ["identical_repeat","cost_velocity_accel"]
+	Confidence      float64  // 0..1
+	ActionCeiling   Action   // the strongest action the evidence permits
+	DetectorVersion string   // always loop.DetectorVersion — set by Observe()
 	Reason        string   // one human-readable sentence
 	HadSession    bool
 }
@@ -185,22 +191,41 @@ func decide(s State, obs Observation, cfg Config) Decision {
 	var fired []string
 	var s1, s2, s3, s4 float64 // magnitudes 0..1
 
-	// S1 — mechanical repetition: identical / alternating / no-op.
-	// (The proven three-pattern core, ported from pydantic-deepagents, MIT.)
+	// S1 — mechanical repetition: identical / alternating / no-op / cycle /
+	// cross-tool homogeneity. The original three patterns (identical, alternating,
+	// noop) are proven in production by pydantic-deepagents (MIT). The new patterns
+	// (cycle, args_homogeneity, result_homogeneity) close evasion gaps found by
+	// adversarial testing: 3+ tool rotations and cross-tool identical payloads
+	// were completely invisible to v1.0.0.
 	identical := checkRepeated(s.CallHistory, cfg.MaxRepeated)
 	alternating := checkAlternating(s.CallHistory, cfg.MaxRepeated)
 	noop := checkNoop(s.ResultHistory, cfg.MaxRepeated)
+	cycle := checkCycle(s.CallHistory, historyCap/2)
+	argsHomogeneous := checkArgsHomogeneity(s.CallHistory, cfg.MaxRepeated)
+	resultHomogeneous := checkResultHomogeneity(s.ResultHistory, cfg.MaxRepeated)
 	argsChanging := !identical && repeatedTool(s.CallHistory, cfg.MaxRepeated)
 
-	if identical || alternating || noop {
+	if identical || alternating || noop || cycle || argsHomogeneous || resultHomogeneous {
 		s1 = 1.0
-		switch {
-		case identical:
+		// Report ALL matching S1 patterns — they describe different facets of the
+		// same repetitive behavior and are valuable for debugging / alerting.
+		if identical {
 			fired = append(fired, "identical_repeat")
-		case alternating:
+		}
+		if alternating {
 			fired = append(fired, "alternating_repeat")
-		case noop:
+		}
+		if noop {
 			fired = append(fired, "noop_repeat")
+		}
+		if cycle {
+			fired = append(fired, "cycle_repeat")
+		}
+		if resultHomogeneous {
+			fired = append(fired, "result_homogeneity")
+		}
+		if argsHomogeneous {
+			fired = append(fired, "args_homogeneity")
 		}
 	}
 
@@ -229,26 +254,57 @@ func decide(s State, obs Observation, cfg Config) Decision {
 	// "repeating" from "repeating without progress".
 	weighted := 0.40*s1 + 0.35*s2 + 0.15*s3 + 0.10*s4
 
-	// PROGRESS OVERRIDE — the single most important line for avoiding false positives.
-	// If the tool is repeating but its ARGUMENTS are changing, that is the signature of
-	// legitimate batch work (ticket 1, 2, 3...). Heavily discount confidence.
+	// PROGRESS OVERRIDE — if the tool is repeating but ARGUMENTS change, that's
+	// the signature of legitimate batch work (ticket 1, 2, 3...). Discount confidence.
+	// However, if the RESULTS are identical despite changing args (noop/resultHomogeneous),
+	// that's weaker evidence of progress — the inputs vary but produce nothing new.
 	if argsChanging {
-		weighted *= 0.3
+		if noop || resultHomogeneous {
+			weighted *= 0.5 // partial: different inputs, same output
+		} else {
+			weighted *= 0.3 // full override: genuine batch work
+		}
 	}
+
+	// SUSTAINED REPETITION — when stuck-ness far exceeds the base threshold, it is
+	// strong enough evidence to amplify confidence and substitute for cost acceleration
+	// in the block ceiling. This closes the v1.0.0 gap where flat-cost runaways
+	// (100 identical failing calls at $0.05 each) could only ever reach WARN.
+	deepThreshold := 2 * cfg.MaxRepeated
+	deepRepetition := checkRepeated(s.CallHistory, deepThreshold) ||
+		checkNoop(s.ResultHistory, deepThreshold) ||
+		checkResultHomogeneity(s.ResultHistory, deepThreshold)
+	if deepRepetition {
+		weighted += 0.35
+		fired = append(fired, "sustained_repetition")
+	}
+
 	confidence := clamp(weighted, 0, 1)
 
 	// ---- Confluence ceiling: the safety core. ----
-	// BLOCK requires ALL of: a session id, >=2 signals, accelerating cost,
-	// evidence of no-progress, and high confidence. A flat-cost changing-args
-	// batch job cannot satisfy this no matter how many turns it runs.
+	// BLOCK requires ALL of: a session id, >=2 signals, evidence of stuck-ness
+	// (cost acceleration OR sustained repetition over time), evidence of
+	// no-progress, and high confidence. A flat-cost changing-args batch job
+	// cannot satisfy this.
+	//
+	// Deep repetition without cost acceleration only qualifies for block when
+	// the repeating calls span at least VelocityWindowMs/10 (~30s). This
+	// prevents blocking legitimate rapid bursts (50 embedding calls in 2s).
 	hadSession := obs.SessionID != ""
-	noProgress := identical || noop || s4 > 0 // not merely volume — actual stuck-ness
+	noProgress := identical || noop || s4 > 0 || cycle || argsHomogeneous || resultHomogeneous
+
+	costSpan := int64(0)
+	if len(s.CostEvents) >= 2 {
+		costSpan = s.CostEvents[len(s.CostEvents)-1].T - s.CostEvents[0].T
+	}
+	minSpan := cfg.VelocityWindowMs / 10
+	deepQualifies := deepRepetition && costSpan >= minSpan
 
 	ceiling := ActionNone
 	switch {
 	case (!cfg.RequireSessionForBlock || hadSession) &&
 		len(fired) >= 2 &&
-		accelerating &&
+		(accelerating || deepQualifies) &&
 		noProgress &&
 		confidence >= cfg.BlockConfidence:
 		ceiling = ActionBlock
@@ -257,11 +313,12 @@ func decide(s State, obs Observation, cfg Config) Decision {
 	}
 
 	return Decision{
-		SignalsFired:  fired,
-		Confidence:    round2(confidence),
-		ActionCeiling: ceiling,
-		Reason:        reason(ceiling, fired, ratio, argsChanging),
-		HadSession:    hadSession,
+		SignalsFired:    fired,
+		Confidence:      round2(confidence),
+		ActionCeiling:   ceiling,
+		Reason:          reason(ceiling, fired, ratio, argsChanging),
+		HadSession:      hadSession,
+		DetectorVersion: DetectorVersion,
 	}
 }
 
@@ -338,6 +395,79 @@ func repeatedTool(h []callKey, n int) bool {
 		}
 	}
 	return true
+}
+
+// checkCycle detects repeating subsequences of length 3..maxPeriod in call history.
+// Catches A-B-C-A-B-C, A-B-C-D-A-B-C-D, etc. that checkAlternating (period-2 only) misses.
+// Requires 2 complete cycles to fire. With historyCap=12, maxPeriod=6.
+func checkCycle(h []callKey, maxPeriod int) bool {
+	for period := 3; period <= maxPeriod; period++ {
+		needed := period * 2
+		if len(h) < needed {
+			continue
+		}
+		tail := h[len(h)-needed:]
+		match := true
+		for i := period; i < needed; i++ {
+			if tail[i] != tail[i-period] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+// checkArgsHomogeneity detects identical arguments across different tools.
+// Catches the evasion where an agent retries the same payload with different tools.
+func checkArgsHomogeneity(h []callKey, n int) bool {
+	if len(h) < n {
+		return false
+	}
+	tail := h[len(h)-n:]
+	// Must involve multiple tools; otherwise checkRepeated already covers it.
+	sameTool := true
+	for _, e := range tail {
+		if e.Tool != tail[0].Tool {
+			sameTool = false
+			break
+		}
+		if e.ArgsHash != tail[0].ArgsHash {
+			return false
+		}
+	}
+	if sameTool {
+		return false // same tool + same args = identical_repeat, not this signal
+	}
+	for _, e := range tail {
+		if e.ArgsHash != tail[0].ArgsHash {
+			return false
+		}
+	}
+	return true
+}
+
+// checkResultHomogeneity detects identical results across different tools (cross-tool noop).
+// checkNoop requires same (tool, result) pair; this ignores the tool name.
+func checkResultHomogeneity(h []resultKey, n int) bool {
+	if len(h) < n {
+		return false
+	}
+	tail := h[len(h)-n:]
+	// Must involve multiple tools; otherwise checkNoop already covers it.
+	sameTool := true
+	for _, e := range tail {
+		if e.Tool != tail[0].Tool {
+			sameTool = false
+		}
+		if e.ResultHash != tail[0].ResultHash {
+			return false
+		}
+	}
+	return !sameTool
 }
 
 // costVelocityRatio = cost in [now-W, now] divided by cost in [now-2W, now-W].
