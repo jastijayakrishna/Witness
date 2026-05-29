@@ -382,8 +382,9 @@ func (d *Drainer) insertBatch(ctx context.Context, batch []wal.Record) error {
 				cost, latency_ms, status_code, cache_hit, stream,
 				session_id, tool_signature, args_fingerprint,
 				loop_signals_fired, loop_confidence, loop_action,
-				prev_hash, record_hash
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+				prev_hash, record_hash,
+				trajectory_id, detector_version, framework, near_miss, immediate_outcome
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
 			ON CONFLICT (record_hash) DO NOTHING
 		`,
 			rec.ID, rec.Time, rec.Project, rec.Provider, rec.Model, rec.PromptHash,
@@ -392,6 +393,8 @@ func (d *Drainer) insertBatch(ctx context.Context, batch []wal.Record) error {
 			rec.SessionID, rec.ToolSignature, rec.ArgsFingerprint,
 			rec.LoopSignalsFired, rec.LoopConfidence, rec.LoopAction,
 			rec.PrevHash, rec.RecordHash,
+			rec.TrajectoryID, rec.DetectorVersion,
+			frameworkOrUnknown(rec.Framework), rec.NearMiss, outcomeOrUnknown(rec.ImmediateOutcome),
 		)
 		if err != nil {
 			return fmt.Errorf("insert wal_record: %w", err)
@@ -483,4 +486,22 @@ func (d *Drainer) saveOffset(offset drainOffset) error {
 	}
 
 	return nil
+}
+
+// frameworkOrUnknown preserves the 'unknown' column default when the WAL record
+// has no detected framework, instead of writing an empty string.
+func frameworkOrUnknown(s string) string {
+	if s == "" {
+		return "unknown"
+	}
+	return s
+}
+
+// outcomeOrUnknown preserves the 'unknown' column default when the WAL record
+// has no recorded immediate outcome.
+func outcomeOrUnknown(s string) string {
+	if s == "" {
+		return "unknown"
+	}
+	return s
 }
