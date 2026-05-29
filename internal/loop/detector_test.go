@@ -12,6 +12,18 @@ func feed(cfg Config, obs []Observation) (State, Decision) {
 	return s, d
 }
 
+// feedAll runs a sequence and returns ALL decisions (one per observation).
+func feedAll(cfg Config, obs []Observation) []Decision {
+	s := State{}
+	var ds []Decision
+	for _, o := range obs {
+		var d Decision
+		s, d = Observe(s, o, cfg)
+		ds = append(ds, d)
+	}
+	return ds
+}
+
 // makeBatch builds a legitimate high-volume job: same tool, CHANGING args, FLAT cost.
 func makeBatch(n int, sessionID string) []Observation {
 	out := make([]Observation, n)
