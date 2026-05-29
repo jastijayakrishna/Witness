@@ -1,5 +1,22 @@
 package providers
 
+import (
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/rs/zerolog/log"
+)
+
+var unknownModelTotal = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "llmproxy_unknown_model_total",
+		Help: "Requests with models not in the pricing table. Cost recorded as zero.",
+	},
+	[]string{"model"},
+)
+
+func init() {
+	prometheus.MustRegister(unknownModelTotal)
+}
+
 // ModelPricing holds per-token costs in USD.
 type ModelPricing struct {
 	InputPerToken  float64
@@ -37,10 +54,14 @@ var PricingTable = map[string]ModelPricing{
 }
 
 // ComputeCost calculates the USD cost for a given model and token counts.
-// Returns 0 if the model is not found in the pricing table.
+// Logs a warning and returns 0 if the model is not found in the pricing table.
 func ComputeCost(model string, inputTokens, outputTokens int) float64 {
 	p, ok := PricingTable[model]
 	if !ok {
+		if model != "" {
+			unknownModelTotal.WithLabelValues(model).Inc()
+			log.Warn().Str("model", model).Msg("unknown model: cost recorded as $0 — update PricingTable")
+		}
 		return 0
 	}
 	return float64(inputTokens)*p.InputPerToken + float64(outputTokens)*p.OutputPerToken
