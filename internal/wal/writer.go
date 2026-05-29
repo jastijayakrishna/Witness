@@ -83,6 +83,15 @@ type Record struct {
 	PrevHash        string    `json:"prev_hash"`                   // Phase 2: hash of previous record
 	RecordHash      string    `json:"record_hash"`                 // Phase 2: hash of this record
 	ChainRestart    bool      `json:"chain_restart,omitempty"`     // Phase 2: crash recovery marker
+
+	// v5.2 moat hooks — cheap now, impossible to retrofit later.
+	// Every record carries these from day 1 so replay, training, and
+	// auditing pipelines can always reconstruct who decided what and why.
+	TrajectoryID    string   `json:"trajectory_id,omitempty"`    // UUID per session — groups a run into one trajectory
+	DetectorVersion string   `json:"detector_version,omitempty"` // loop.DetectorVersion — which algo made this call
+	Framework       string   `json:"framework,omitempty"`        // detected agent framework (langchain/crewai/unknown)
+	NearMiss        bool     `json:"near_miss,omitempty"`        // confidence 0.50–0.69 — valuable training signal
+	ImmediateOutcome string  `json:"immediate_outcome,omitempty"` // success/blocked/error — set by handler
 }
 
 // SyncMode constants for WAL writer fsync behavior.
