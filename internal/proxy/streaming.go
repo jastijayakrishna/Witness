@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,9 +13,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 
-	"github.com/witness-proxy/witness-proxy/internal/attribution"
 	"github.com/witness-proxy/witness-proxy/internal/providers"
-	"github.com/witness-proxy/witness-proxy/internal/wal"
 )
 
 func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, provider *providers.Provider, body []byte, project, sessionID string) {
@@ -37,6 +36,11 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, provider 
 		body = modified
 	}
 
+	// Cancellable context — the idle timer below will cancel this if the
+	// upstream stops sending data, closing the connection and unblocking reads.
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
 	// Build upstream request
 	upstreamPath := strings.TrimPrefix(r.URL.Path, provider.PathPrefix)
 	upstreamURL := fmt.Sprintf("%s%s", provider.Target.String(), upstreamPath)
@@ -44,7 +48,7 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, provider 
 		upstreamURL += "?" + r.URL.RawQuery
 	}
 
-	upReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, bytes.NewReader(body))
+	upReq, err := http.NewRequestWithContext(ctx, r.Method, upstreamURL, bytes.NewReader(body))
 	if err != nil {
 		log.Error().Err(err).Msg("failed to create upstream stream request")
 		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
@@ -56,16 +60,39 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, provider 
 
 	resp, err := h.Transport.RoundTrip(upReq)
 	if err != nil {
+		if ctx.Err() != nil {
+			log.Error().Err(err).Msg("upstream stream request timed out or cancelled")
+			http.Error(w, `{"error":"upstream request timed out"}`, http.StatusGatewayTimeout)
+			return
+		}
 		log.Error().Err(err).Msg("upstream stream request failed")
 		http.Error(w, `{"error":"upstream request failed"}`, http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
+	// Start idle timer — fires if no data arrives for upstreamStreamIdleTimeout,
+	// cancelling the context which closes the upstream connection.
+	idleTimer := time.AfterFunc(h.StreamIdleTimeout, func() {
+		upstreamTimeouts.WithLabelValues("idle").Inc()
+		log.Warn().Str("provider", provider.Name).Msg("upstream stream idle timeout — closing connection")
+		cancel()
+	})
+	defer idleTimer.Stop()
+
 	// If the upstream returned a non-streaming response (e.g., error), pass it through directly
 	contentType := resp.Header.Get("Content-Type")
 	if !strings.Contains(contentType, "text/event-stream") {
-		respBody, _ := io.ReadAll(resp.Body)
+		cap := h.MaxResponseBody
+		if cap <= 0 {
+			cap = maxResponseBodySize
+		}
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, cap+1))
+		if int64(len(respBody)) > cap {
+			log.Warn().Int64("cap", cap).Msg("upstream non-SSE response exceeded body cap — truncated")
+			http.Error(w, `{"error":"upstream response too large"}`, http.StatusBadGateway)
+			return
+		}
 		copyHeaders(resp.Header, w.Header())
 		w.WriteHeader(resp.StatusCode)
 		w.Write(respBody)
@@ -97,6 +124,7 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, provider 
 	var currentEvent providers.SSEEvent
 
 	for scanner.Scan() {
+		idleTimer.Reset(h.StreamIdleTimeout)
 		line := scanner.Text()
 
 		if line == "" {
@@ -151,6 +179,15 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, provider 
 		}
 	}
 
+	// Log stream read errors (includes idle timeout termination)
+	if err := scanner.Err(); err != nil {
+		if ctx.Err() != nil {
+			log.Warn().Str("provider", provider.Name).Msg("stream terminated by idle timeout")
+		} else {
+			log.Warn().Err(err).Str("provider", provider.Name).Msg("stream read error")
+		}
+	}
+
 	// Handle any remaining event
 	if currentEvent.Data != "" || currentEvent.Event != "" {
 		if isUsageRelevantEvent(provider.Name, currentEvent, len(usageEvents) == 0) {
@@ -188,50 +225,8 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, provider 
 		toolCalls = provider.ExtractStreamToolCalls(toolCallEvents)
 	}
 
-	cost := providers.ComputeCost(usage.Model, usage.InputTokens, usage.OutputTokens)
-	promptHash := hashPrompt(body)
-
-	// Compute tool signature + args fingerprint (Phase 2)
-	toolSig, argsFP := computeToolFingerprints(toolCalls)
-
-	// Log normalization ratio per project (Phase 2)
-	ratio := attribution.NormalizationRatio(string(body))
-	normalizationRatio.WithLabelValues(project).Set(ratio)
-	if ratio < 0.5 {
-		log.Warn().
-			Str("project", project).
-			Float64("ratio", ratio).
-			Msg("low normalization ratio: project feeds mostly dynamic data, dedup accuracy is lower")
-	}
-
-	// Loop detection (shadow mode — observe only, no enforcement yet)
-	loopSignals, loopConf, loopAct := h.observeLoop(r.Context(), project, sessionID, toolCalls, usage, cost)
-
-	// Write WAL BEFORE client connection closes
-	walErr := h.WAL.Write(wal.Record{
-		Project:          project,
-		Provider:         provider.Name,
-		Model:            usage.Model,
-		PromptHash:       promptHash,
-		InputTokens:      usage.InputTokens,
-		OutputTokens:     usage.OutputTokens,
-		TotalTokens:      usage.TotalTokens,
-		Cost:             cost,
-		LatencyMs:        latency.Milliseconds(),
-		StatusCode:       resp.StatusCode,
-		CacheHit:         false,
-		Stream:           true,
-		SessionID:        sessionID,
-		ToolSignature:    toolSig,
-		ArgsFingerprint:  argsFP,
-		LoopSignalsFired: loopSignals,
-		LoopConfidence:   loopConf,
-		LoopAction:       loopAct,
-	})
-	if walErr != nil {
-		walWriteFailures.Inc()
-		log.Error().Err(walErr).Msg("failed to write WAL for stream — reconciliation gap")
-	}
+	// Finalize: compute cost, normalization, loop detection, and write WAL
+	h.finalizeRequest(r.Context(), provider.Name, body, usage, toolCalls, latency, resp.StatusCode, true, project, sessionID)
 }
 
 // isUsageRelevantEvent returns true if this event should be kept for usage
