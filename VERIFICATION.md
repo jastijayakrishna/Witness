@@ -114,6 +114,7 @@ configs/proxy.yaml.example
   - [x] Goroutine fsyncs every 100ms OR every 50 records
   - [x] Uses `os.File.Sync()`
   - [x] **WAL write happens BEFORE response returns to client** ✅ VERIFIED
+    - Note: fsync timing depends on `wal.sync_mode` — in "sync" mode, fsync happens before return; in "batch" mode (default), fsync happens every 50 records or 100ms
   - [x] Daily file rotation (based on UTC date)
   - [x] JSONL format (one record per line)
   - [x] Timestamps in UTC
@@ -451,7 +452,7 @@ All deliverables met. Binary boots, talks to Postgres + Redis, serves /healthz a
 
 ### Phase 1: ✅ COMPLETE
 
-All deliverables met. OpenAI + Anthropic proxying works (streaming + non-streaming), usage extracted correctly, costs computed, WAL written with fsync-before-return guarantee.
+All deliverables met. OpenAI + Anthropic proxying works (streaming + non-streaming), usage extracted correctly, costs computed, WAL written before return; fsync timing depends on `wal.sync_mode` ("sync" for per-request fsync, "batch" for batched).
 
 ### Tests: ✅ PRODUCTION-GRADE
 
