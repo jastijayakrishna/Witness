@@ -10,6 +10,13 @@
 *.test
 *.out
 coverage.txt
+test-report.txt
+test-results.csv
+test-summary.txt
+.gocache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
 
 # Vendor (use go mod)
 /vendor/
@@ -33,6 +40,12 @@ wal-offset.json
 
 # Planning docs (not part of shipped product)
 implementation.txt
+plan.md
+CURRENT_STATUS.md
+WHAT_WE_BUILT.txt
+CLAUDE.md
+AGENTS.md
 
 # IDE/Tools
 .claude/
+.codex/

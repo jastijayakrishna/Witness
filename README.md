@@ -1,283 +1,545 @@
-# Witness Proxy
+# Witness Action Firewall
 
-Open-source LLM cost proxy with usage tracking, budget enforcement, and Slack reporting.
+Witness stops AI agents from repeating dangerous or useless actions before they execute, and produces a tamper-evident receipt for every decision.
 
-## Features (Phase 0 + Phase 1)
+It sits in front of LLM and tool calls. For tools, Witness acts as a pre-execution action firewall: legitimate reads pass through, repeated side-effect attempts are caught with idempotency keys, no-progress loops are detected from results, and every allow/warn/block decision is written to a hash-chained WAL.
 
-- **Multi-provider support**: OpenAI, Anthropic (Gemini + Cohere in Phase 5)
-- **Streaming & non-streaming**: Full SSE streaming support with usage capture
-- **Write-ahead log (WAL)**: Durable usage tracking with configurable fsync (batch mode: every 50 records or 100ms; sync mode: per-request fsync)
-- **Cost calculation**: Real-time cost tracking with hardcoded per-token pricing
-- **Attribution**: Project resolution via `X-Project` header or SHA256(Authorization) fallback
-- **Health & metrics**: `/healthz` endpoint and Prometheus `/metrics`
+## The Problem
 
-## Quick Start
+Agent loops are expensive, risky, and hard to debug:
 
-### Prerequisites
+- An agent retries the same tool with the same bad args.
+- An agent repeats the same customer-visible side effect, such as sending an email, refunding an invoice, opening a ticket, or triggering a deploy.
+- A dangerous action is attempted without a stable idempotency key.
+- A tool keeps returning `not_found`, `permission_error`, `timeout`, or `rate_limited`.
+- The model keeps spending tokens while making no state progress.
+- Operators only notice after the bill, duplicate action, or incident.
 
-- Docker & Docker Compose
-- (Optional) Go 1.23+ for local development
+Witness is built for one job: **send legitimate work through, stop repeated dangerous or useless actions before execution, and prove every decision with an audit trail.**
 
-### Run with Docker Compose
+## Current Status
+
+Production-shaped MVP:
+
+- OpenAI, Anthropic, and Gemini proxy support
+- Streaming and non-streaming usage capture
+- Pre-execution action firewall for tool calls
+- Postgres-backed durable action ledger for duplicate side-effect prevention
+- Tool-event fuse for pre-tool and post-tool loop detection
+- Redis-backed loop state with detector version `2.2.0`
+- Shadow, warn, and block modes
+- Decision receipts with `decision_id`, `policy_version`, `action_risk`, effect scope, reason, evidence, and optional HMAC signature
+- Fail-open SDK defaults
+- Budget seatbelt with atomic Redis reservations
+- Tamper-evident JSONL WAL with hash chaining
+- Separate WAL drain worker for Postgres reconciliation
+- Provider doctor for Gemini key/model/quota/pricing checks
+- Shadow report for would-block review and first policy recommendation
+- Receipt verifier for hash-chain, decision-field, and signed-receipt integrity
+- Real-trace eval harness for recall, precision, missed runaways, false positives, latency, and saved cost
+
+Brutal honest status: the repo is technically strong enough for MVP. The remaining proof gap is real customer shadow traces.
+
+## Fastest Safe Rollout
+
+Use hosted Witness if you have a provisioned endpoint:
 
 ```bash
-cd deploy
-docker compose up --build
+export WITNESS_BASE_URL=https://YOUR_WITNESS_ENDPOINT
+export WITNESS_PROJECT_KEY=your_project_key
+```
+
+Run the Witness preflight:
+
+```bash
+go run ./cmd/witness doctor \
+  -base-url "$WITNESS_BASE_URL" \
+  -project "$WITNESS_PROJECT_KEY"
+```
+
+Expected shape:
+
+```text
+Witness doctor
+base_url: https://YOUR_WITNESS_ENDPOINT
+[ok] base_url: https://YOUR_WITNESS_ENDPOINT
+[ok] healthz: {"status":"healthy"}
+[ok] tool_check: action=allow
+[ok] tool_result: action=allow
+```
+
+Then route model calls through Witness:
+
+```bash
+export OPENAI_BASE_URL="$WITNESS_BASE_URL/openai/v1"
+```
+
+Shadow mode is the default. Witness records what it would warn or block without interrupting the agent.
+
+## Local Demo
+
+```bash
+docker compose -f deploy/docker-compose.yml up --build
 ```
 
 Services:
-- Proxy: `http://localhost:8080`
-- Postgres: `localhost:5432` (user: witness, db: witness)
-- Redis: `localhost:6379`
 
-### Verify
+- Proxy: `http://localhost:8080`
+- WAL drain metrics: `http://localhost:9090/metrics`
+- Postgres: `localhost:5433`
+- Redis: `localhost:6380`
+
+Verify:
 
 ```bash
-# Health check
+go run ./cmd/witness doctor -base-url http://localhost:8080
 curl http://localhost:8080/healthz
-# {"status":"healthy"}
-
-# Prometheus metrics
 curl http://localhost:8080/metrics
 ```
 
-## Usage
+## Provider Preflight
 
-### OpenAI (non-streaming)
+For Gemini, put a temporary key in `.env`:
 
-```bash
-curl http://localhost:8080/openai/v1/chat/completions \
-  -H "Authorization: Bearer YOUR_OPENAI_KEY" \
-  -H "X-Project: my-project" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-4o-mini",
-    "messages": [{"role": "user", "content": "Hello!"}]
-  }'
+```env
+GOOGLE_API_KEY=...
 ```
 
-### OpenAI (streaming)
+Then verify key validity, model access, quota, and pricing:
+
+```bash
+go run ./cmd/witness provider-doctor \
+  -provider gemini \
+  -model gemini-2.5-flash-lite
+```
+
+Expected shape:
+
+```text
+Witness provider doctor
+provider: gemini
+model: gemini-2.5-flash-lite
+base_url: https://generativelanguage.googleapis.com
+[ok] api_key: present
+[ok] base_url: https://generativelanguage.googleapis.com
+[ok] model_status: active_or_not_known_deprecated
+[ok] pricing_known: cost can be computed
+[ok] models_list: models_visible=...
+[ok] model_available: gemini-2.5-flash-lite visible
+[ok] quota_generate_content: status=200 model_version=... total_tokens=...
+```
+
+## Proxy Examples
+
+OpenAI:
 
 ```bash
 curl http://localhost:8080/openai/v1/chat/completions \
   -H "Authorization: Bearer YOUR_OPENAI_KEY" \
   -H "X-Project: my-project" \
+  -H "X-Session-ID: sess-123" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-4o-mini",
-    "messages": [{"role": "user", "content": "Hello!"}],
+    "messages": [{"role": "user", "content": "Hello"}],
     "stream": true
   }'
 ```
 
-### Anthropic
+Anthropic:
 
 ```bash
 curl http://localhost:8080/anthropic/v1/messages \
   -H "x-api-key: YOUR_ANTHROPIC_KEY" \
-  -H "X-Project: my-project" \
-  -H "Content-Type: application/json" \
   -H "anthropic-version: 2023-06-01" \
+  -H "X-Project: my-project" \
+  -H "X-Session-ID: sess-123" \
+  -H "Content-Type: application/json" \
   -d '{
     "model": "claude-3-5-sonnet-20241022",
-    "messages": [{"role": "user", "content": "Hello!"}],
+    "messages": [{"role": "user", "content": "Hello"}],
     "max_tokens": 100
   }'
 ```
 
-### Using the Python SDK
+Gemini:
+
+```bash
+curl http://localhost:8080/gemini/v1beta/models/gemini-2.5-flash-lite:generateContent \
+  -H "x-goog-api-key: YOUR_GOOGLE_API_KEY" \
+  -H "X-Project: my-project" \
+  -H "X-Session-ID: sess-123" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "contents": [{
+      "parts": [{"text": "Hello"}]
+    }]
+  }'
+```
+
+## Action Firewall
+
+The proxy sees model calls. The action firewall checks consequential actions before execution and records results after execution, which is where agent loops and duplicate side effects become obvious.
+
+Python:
 
 ```python
-from openai import OpenAI
+from witness_agent import WitnessClient
 
-client = OpenAI(
-    base_url="http://localhost:8080/openai/v1",
-    api_key="YOUR_OPENAI_KEY",
-    default_headers={"X-Project": "my-python-app"}
+witness = WitnessClient(
+    base_url="http://localhost:8080",
+    project="my-project",
+    session_id="sess-123",
 )
 
-response = client.chat.completions.create(
-    model="gpt-4o-mini",
-    messages=[{"role": "user", "content": "Hello!"}],
-    stream=True
+@witness.action
+def search_docs(query: str):
+    return retriever.search(query)
+
+def refund_key(call):
+    invoice_id = call["kwargs"]["invoice_id"] if "invoice_id" in call["kwargs"] else call["args"][0]
+    amount_cents = call["kwargs"]["amount_cents"] if "amount_cents" in call["kwargs"] else call["args"][1]
+    return f"refund:{invoice_id}:{amount_cents}"
+
+@witness.action(
+    risk="money_movement",
+    idempotency_key=refund_key,
+    resource_id=lambda call: call["kwargs"].get("invoice_id") or call["args"][0],
+    amount_cents=lambda call: call["kwargs"].get("amount_cents") or call["args"][1],
+    max_amount_cents=5000,
 )
-
-for chunk in response:
-    print(chunk.choices[0].delta.content or "", end="")
+def refund_customer(invoice_id: str, amount_cents: int):
+    return payments.refund(invoice_id, amount_cents)
 ```
 
-## Architecture
+JavaScript:
 
-```
-Client → Proxy (port 8080)
-          ├─→ Resolve project (X-Project or SHA256(auth))
-          ├─→ Forward to OpenAI/Anthropic
-          ├─→ Extract usage from response
-          ├─→ Compute cost from hardcoded pricing
-          ├─→ Write to WAL (configurable: batch or per-request fsync)
-          └─→ Return response to client
+```js
+const { WitnessClient } = require("./sdk/javascript/witness-agent");
 
-WAL → data/wal/wal-YYYY-MM-DD.jsonl (append-only, fsynced (batch or sync mode))
+const witness = new WitnessClient({
+  baseUrl: "http://localhost:8080",
+  project: "my-project",
+  sessionId: "sess-123",
+});
+
+const searchDocs = witness.action(async function searchDocs(query) {
+  return retriever.search(query);
+});
+
+const refundCustomer = witness.action(
+  async function refundCustomer(invoiceId, amountCents) {
+    return payments.refund(invoiceId, amountCents);
+  },
+  {
+    risk: "money_movement",
+    idempotencyKey: ({ args }) => `refund:${args[0]}:${args[1]}`,
+    resourceId: ({ args }) => args[0],
+    amountCents: ({ args }) => args[1],
+    maxAmountCents: 5000,
+  }
+);
 ```
+
+For read-only tools, `risk` defaults to `read` and no idempotency key is required. For side-effect tools, set `risk` to `write`, `customer_visible`, `money_movement`, or `dangerous`, and pass a stable `idempotency_key` for the real-world action being attempted.
+
+The `/v1/action/check` endpoint is the pre-execution gate. SDK wrappers call it before the action runs. The `/v1/action/result` endpoint records what happened after the action runs. `/v1/tool/check` and `/v1/tool/result` remain as compatibility aliases.
+
+Direct API:
+
+```bash
+curl http://localhost:8080/v1/action/check \
+  -H "X-Project: my-project" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "session_id": "sess-123",
+    "action_name": "refund_customer",
+    "action_risk": "money_movement",
+    "idempotency_key": "refund:invoice_9:5000",
+    "resource_id": "invoice_9",
+    "amount_cents": 5000,
+    "max_amount_cents": 5000,
+    "args": {"invoice_id": "invoice_9", "amount_cents": 5000}
+  }'
+```
+
+Important request fields:
+
+| Field | Purpose |
+| --- | --- |
+| `action_name` | Name of the real-world action being attempted. |
+| `action_risk` | `read`, `write`, `customer_visible`, `money_movement`, or `dangerous`. |
+| `idempotency_key` | Stable key for the real-world side effect, such as `refund:invoice_9:5000`. |
+| `resource_id` | Optional real-world object being touched, such as an invoice, account, ticket, or deployment. |
+| `amount_cents`, `max_amount_cents` | Optional money/action bound. Witness blocks when `amount_cents` exceeds the declared maximum. |
+| `backup_id` | Required safety prerequisite for `dangerous` actions unless a valid capability token is supplied. |
+| `recipient`, `allowed_domain` | Optional customer-visible guard. Witness blocks when the recipient domain is outside policy. |
+| `capability_token` | Optional HMAC-scoped authority for high-risk actions. Verified with `WITNESS_ACTION_CAPABILITY_SECRET`. |
+| `duplicate_window_seconds` | Optional duplicate window. Defaults to 24 hours. |
+| `agent_id`, `user_id` | Optional attribution fields for receipts and review. |
+
+Duplicate side-effect rule:
+
+- First `write`/`dangerous` action with a new idempotency key is allowed and recorded.
+- A repeated action with the same project and idempotency key is a high-confidence `duplicate_side_effect`.
+- A `write` action without an idempotency key warns; a `dangerous` action without one is blockable in `block` mode.
+- A money-moving action over `max_amount_cents` is blocked before execution.
+- A dangerous action with an idempotency key still needs `backup_id` or a valid scoped `capability_token`.
+- In `shadow` mode, Witness allows the action but records `would_action=block`.
+- In `block` mode, Witness returns `429` before the tool executes.
+
+Every decision response includes a receipt:
+
+```json
+{
+  "action": "allow",
+  "action_name": "refund_customer",
+  "would_action": "block",
+  "reason": "duplicate side-effect blocked: idempotency key was already seen",
+  "receipt": {
+    "decision_id": "sha256...",
+    "action_name": "refund_customer",
+    "policy_version": "action-firewall/2",
+    "action_risk": "write",
+    "idempotency_key": "refund:invoice_9:5000",
+    "resource_id": "invoice_9",
+    "amount_cents": 5000,
+    "max_amount_cents": 5000,
+    "evidence": ["idempotency_key=repeated", "duplicate_window=24h0m0s"],
+    "signature": "witreceipt_v1...",
+    "key_id": "prod-2026-06"
+  }
+}
+```
+
+SDK defaults are production-safe:
+
+- `WITNESS_FAIL_OPEN=true`: tools continue if Witness is down.
+- `WITNESS_CAPTURE_MODE=fingerprint`: args and results are hashed by default.
+- `WITNESS_TIMEOUT_SECONDS=1.0` for Python and `WITNESS_TIMEOUT_MS=1000` for JavaScript.
+- Raw capture is opt-in with `WITNESS_CAPTURE_MODE=raw`.
+
+## Loop Detection
+
+Witness combines mechanical loop signals with economic signals:
+
+- identical repeated calls
+- alternating repeated calls
+- no-op repeated results
+- cycle repeats
+- argument homogeneity
+- result homogeneity
+- cost velocity
+- context growth
+- output degradation
+- no-progress result classes such as `not_found`, `schema_error`, `permission_error`, `timeout`, and `rate_limited`
+
+Actions:
+
+| Action | Behavior |
+| --- | --- |
+| `shadow` | Record what Witness would do. Default and recommended first rollout. |
+| `warn` | Allow request and emit warning behavior/metrics. |
+| `block` | Return 429 when confidence and safety gates pass. |
+
+Blocking is intentionally conservative. High-confidence block decisions require session context and corroborating no-progress evidence.
+
+## Audit Trail
+
+Every proxied request writes a WAL record before the response returns.
+
+The WAL includes:
+
+- project, provider, model, status code
+- input/output/total tokens and computed cost
+- prompt hash
+- session ID and trajectory ID
+- tool signature and args fingerprint
+- decision ID
+- agent ID and user ID
+- action risk and idempotency key
+- resource ID, amount bounds, backup ID, recipient domain, allowed domain, and capability hash
+- policy version, decision reason, and decision evidence
+- receipt signature and signing key ID when `WITNESS_RECEIPT_SIGNING_SECRET` is set
+- result class and immediate outcome
+- loop signals, confidence, action, evidence, detector version
+- previous hash and record hash
+
+Hash-chain violations halt the drain worker and increment `llmproxy_wal_chain_violation_total`.
+
+Verify exported receipts:
+
+```bash
+go run ./cmd/witness verify-receipts data/wal/*.jsonl
+go run ./cmd/witness verify-receipts -json data/wal/*.jsonl
+WITNESS_RECEIPT_SIGNING_SECRET=... go run ./cmd/witness verify-receipts -require-signatures data/wal/*.jsonl
+```
+
+Expected shape:
+
+```text
+Witness receipt verify
+records=18421 action_receipts=9120 signed_receipts=9120 unsigned_receipts=0 verified=true
+missing_hashes=0 hash_mismatches=0 signature_mismatches=0 chain_broken_at=-1 receipt_field_gaps=0
+```
+
+## Shadow Report
+
+Shadow mode is how you prove the product before enforcing it. Run a report over WAL JSONL to see would-blocks, blocked actions, duplicate side effects, no-progress events, estimated wasted cost, and the first policy Witness recommends enabling.
+
+```bash
+go run ./cmd/witness shadow-report data/wal/*.jsonl
+go run ./cmd/witness shadow-report -json data/wal/*.jsonl
+```
+
+Expected shape:
+
+```text
+Witness shadow report
+records=18421 tool_events=9120 action_receipts=9120
+would_block=37 blocked=0 duplicate_side_effects=9 no_progress_events=141
+estimated_wasted_cost_usd=18.420000
+recommended_first_policy=block duplicate side-effect actions with stable idempotency keys
+```
+
+## Proving It On Real Traces
+
+Synthetic tests are useful, but the production proof is shadow data.
+
+Export real shadow traces, anonymize them, then run quality gates:
+
+```bash
+go run ./cmd/witness eval raw-shadow.jsonl \
+  -anonymize-out testdata/real_shadow/customer-a.jsonl \
+  -salt "$WITNESS_ANON_SALT"
+
+go run ./cmd/witness eval -assert testdata/real_shadow/customer-a.jsonl
+```
+
+The numbers that matter:
+
+- runaway recall
+- block precision
+- false-positive block rate
+- missed-runaway rate
+- replay p95 decision latency
+- saved cost
+
+This is the bar for claiming production readiness.
 
 ## Configuration
 
-Environment variables (all optional, defaults shown):
+Environment variables:
 
 ```bash
 WITNESS_SERVER_HOST=0.0.0.0
 WITNESS_SERVER_PORT=8080
+
 WITNESS_POSTGRES_HOST=localhost
 WITNESS_POSTGRES_PORT=5432
 WITNESS_POSTGRES_USER=witness
 WITNESS_POSTGRES_PASSWORD=witness
 WITNESS_POSTGRES_DBNAME=witness
 WITNESS_POSTGRES_SSLMODE=disable
+
 WITNESS_REDIS_HOST=localhost
 WITNESS_REDIS_PORT=6379
 WITNESS_REDIS_PASSWORD=
 WITNESS_REDIS_DB=0
+
 WITNESS_WAL_DIR=data/wal
-WITNESS_WAL_SYNC_MODE=batch   # "batch" (default) or "sync" (fsync every write)
+WITNESS_WAL_SYNC_MODE=batch
+
+WITNESS_LOOP_ENABLED=true
+WITNESS_LOOP_ACTION=shadow
+WITNESS_LOOP_MAX_REPEATED=3
+WITNESS_LOOP_VELOCITY_ACCEL_RATIO=1.5
+WITNESS_LOOP_VELOCITY_WINDOW_MS=300000
+WITNESS_LOOP_WARN_CONFIDENCE=0.40
+WITNESS_LOOP_BLOCK_CONFIDENCE=0.70
+WITNESS_LOOP_REQUIRE_SESSION_FOR_BLOCK=true
+
+WITNESS_BUDGET_DAILY_SOFT_USD=0
+WITNESS_BUDGET_DAILY_HARD_USD=0
+WITNESS_BUDGET_RESERVE_PER_REQUEST_USD=0.50
 ```
 
-Or use `configs/proxy.yaml`:
-
-```yaml
-server:
-  host: "0.0.0.0"
-  port: 8080
-
-postgres:
-  host: "postgres"
-  port: 5432
-  user: "witness"
-  password: "witness"
-  dbname: "witness"
-  sslmode: "disable"
-
-redis:
-  host: "redis"
-  port: 6379
-  password: ""
-  db: 0
-
-wal:
-  dir: "data/wal"
-  sync_mode: "batch"   # "batch" (default) or "sync" (fsync every write)
-```
-
-## Database Schema
-
-Tables created on first boot:
-
-- `projects` - Project definitions with timezone, report settings
-- `api_keys` - API key hashes mapped to projects
-- `requests` - Every proxied request with tokens, cost, latency
-- `prompts` - Prompt hash aggregations (total calls, total cost)
-- `budgets` - Per-project budget limits (soft/hard, daily/monthly)
-- `anomalies` - Detected anomalies for alerting
-
-## WAL Format
-
-Append-only JSONL (one record per line):
-
-```json
-{"time":"2025-01-15T10:30:45.123Z","project":"my-project","provider":"openai","model":"gpt-4o-mini","prompt_hash":"a1b2c3d4e5f6g7h8","input_tokens":10,"output_tokens":25,"total_tokens":35,"cost":0.0000105,"latency_ms":342,"status_code":200,"cache_hit":false,"stream":false}
-```
+Or edit `configs/proxy.yaml`.
 
 ## Development
 
-### Build
+Build:
 
 ```bash
-go build ./cmd/proxy
+go build ./...
 ```
 
-### Test
+Run tests:
 
 ```bash
-# Run all tests
 go test ./...
-
-# Run with coverage
-go test ./... -cover
-
-# Run specific package
-go test ./internal/providers -v
-
-# Run benchmarks
-go test ./internal/providers -bench=. -benchmem
-
-# Run fuzz tests (30 seconds each)
-go test ./internal/providers -fuzz=FuzzExtractOpenAIUsage -fuzztime=30s
+go test ./internal/proxy/... -v
+node --check sdk/javascript/witness-agent/index.js
+python -m py_compile sdk/python/witness_agent/langchain.py sdk/python/witness_agent/__init__.py
+go test ./... -bench=. -benchmem
 ```
 
-### Test Categories
+Run gated live Gemini checks:
 
-- **Unit tests** (37): Pure functions, no I/O
-- **Integration tests** (19): Full proxy roundtrip with fake HTTP servers
-- **Regression tests** (9): Real captured API payloads from Jan 2025
-- **Fault injection** (11): Upstream failures, timeouts, malformed responses
-- **Durability tests** (6): WAL recovery, 5000 concurrent writes
-- **Fuzz tests** (6): Random garbage at all JSON parsers
-- **Benchmarks** (13): Performance regression detection
-
-Total: **114 tests**, all passing
-
-### Performance
-
-Measured on Go 1.25, Windows 11:
-
-- Usage extraction: **3µs** (OpenAI), **2µs** (Anthropic)
-- Cost computation: **7ns**
-- WAL write: **14µs** (marshal + append + batched fsync)
-- Full proxy roundtrip: **240µs** (median, including upstream)
-
-## Project Structure
-
-```
-witness-proxy/
-├── cmd/proxy/main.go           # Main entry point
-├── internal/
-│   ├── config/                 # YAML config loader with env overrides
-│   ├── providers/              # OpenAI + Anthropic adapters
-│   │   ├── provider.go         # Provider interface & registry
-│   │   ├── openai.go           # OpenAI usage extraction
-│   │   ├── anthropic.go        # Anthropic usage extraction
-│   │   └── pricing.go          # Hardcoded per-token pricing
-│   ├── proxy/                  # HTTP proxy logic
-│   │   ├── handler.go          # Non-streaming requests
-│   │   ├── streaming.go        # SSE streaming with accumulator
-│   │   └── attribution.go      # Project resolution
-│   ├── wal/                    # Write-ahead log
-│   │   └── writer.go           # Append-only JSONL with batched fsync
-│   └── storage/
-│       ├── schema.sql          # Postgres schema
-│       └── migrate.go          # Embedded migration runner
-├── configs/
-│   ├── proxy.yaml              # Active config
-│   └── proxy.yaml.example      # Example config
-├── deploy/
-│   └── docker-compose.yml      # 3-service stack
-├── Dockerfile                  # Multi-stage Go build
-└── README.md
+```bash
+WITNESS_LIVE_GEMINI=1 \
+WITNESS_LIVE_GEMINI_MODEL=gemini-2.5-flash-lite \
+go test ./internal/proxy -run TestLiveGemini -count=1 -v
 ```
 
-## Roadmap
+Run the live Gemini agent action-firewall check:
 
-- [x] **Phase 0**: Skeleton boots (healthz, metrics, empty DB)
-- [x] **Phase 1**: OpenAI + Anthropic proxying with WAL
-- [ ] **Phase 2**: WAL drain worker, prompt normalization, Postgres reconciliation
-- [ ] **Phase 3**: Redis cache, retry+fallback, budget caps, rate limiting
-- [ ] **Phase 4**: Slack daily reports, anomaly detection
-- [ ] **Phase 5**: Gemini + Cohere, Grafana dashboard, Docker image <20MB
-- [ ] **Phase 6**: 1 paying customer, OSS launch, YC application
+```bash
+WITNESS_LIVE_GEMINI=1 \
+WITNESS_LIVE_GEMINI_AGENT=1 \
+WITNESS_LIVE_GEMINI_MODEL=gemini-2.5-flash \
+go test ./internal/proxy -run TestLiveGeminiAgentActionFirewallDuplicateAndDangerous -count=1 -v
+```
+
+Run the live Gemini mini-soak:
+
+```bash
+WITNESS_LIVE_GEMINI=1 \
+WITNESS_LIVE_GEMINI_SOAK=1 \
+WITNESS_LIVE_GEMINI_MODEL=gemini-2.5-flash-lite \
+go test ./internal/proxy -run TestLiveGeminiProxyMiniSoakConcurrentWAL -count=1 -v
+```
+
+## Project Layout
+
+```text
+cmd/proxy                 Main proxy binary
+cmd/waldrain              Separate WAL drain worker
+cmd/witness               Doctor, provider-doctor, trace eval, shadow report, receipt verify CLI
+internal/config           YAML config and WITNESS_* env overrides
+internal/providers        OpenAI, Anthropic, Gemini, pricing, usage extraction
+internal/proxy            HTTP proxy, streaming, action events, attribution
+internal/loop             Loop detector, Redis state, budgets, overrides, alerts
+internal/wal              JSONL writer, hash chain, crash recovery
+internal/storage          Postgres schema and migrations
+internal/loopeval         Real shadow trace evaluator
+internal/receiptverify    WAL receipt integrity verifier
+sdk/python/witness_agent  Python action firewall SDK
+sdk/javascript/witness-agent JavaScript action firewall SDK
+docs/INSTALL.md           One-page rollout guide
+```
+
+## What Not To Add Yet
+
+Do not add a dashboard, new providers, or complex enterprise policy UI before real shadow data.
+
+The next highest-value work is:
+
+1. Run shadow mode on 3 real users or projects.
+2. Collect at least 100 real traces.
+3. Report false positives, missed runaways, and saved cost.
+4. Tighten detector thresholds from real labels.
 
 ## License
 
 Apache 2.0
-
-## Contributing
-
-This is pre-launch. No external contributions yet. Follow the repo for updates.
