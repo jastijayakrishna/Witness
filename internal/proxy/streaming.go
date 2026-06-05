@@ -16,7 +16,7 @@ import (
 	"github.com/witness-proxy/witness-proxy/internal/providers"
 )
 
-func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, provider *providers.Provider, body []byte, project, sessionID string) {
+func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, provider *providers.Provider, body []byte, project, sessionID string, overridden, budgetReserved bool) {
 	start := time.Now()
 
 	// Before modifying the body, check if the client already requested
@@ -36,9 +36,10 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, provider 
 		body = modified
 	}
 
-	// Cancellable context — the idle timer below will cancel this if the
-	// upstream stops sending data, closing the connection and unblocking reads.
-	ctx, cancel := context.WithCancel(r.Context())
+	// Hard total deadline on the entire stream — even active streams are
+	// terminated after upstreamStreamTotalLimit to prevent runaway costs.
+	// The idle timer below will also cancel early if data stops arriving.
+	ctx, cancel := context.WithTimeout(r.Context(), upstreamStreamTotalLimit)
 	defer cancel()
 
 	// Build upstream request
@@ -60,12 +61,15 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, provider 
 
 	resp, err := h.Transport.RoundTrip(upReq)
 	if err != nil {
+		latency := time.Since(start)
 		if ctx.Err() != nil {
 			log.Error().Err(err).Msg("upstream stream request timed out or cancelled")
+			h.finalizeRequest(r.Context(), provider.Name, body, providers.Usage{}, nil, latency, http.StatusGatewayTimeout, []byte(`{"error":"upstream request timed out"}`), false, project, sessionID, overridden, budgetReserved)
 			http.Error(w, `{"error":"upstream request timed out"}`, http.StatusGatewayTimeout)
 			return
 		}
 		log.Error().Err(err).Msg("upstream stream request failed")
+		h.finalizeRequest(r.Context(), provider.Name, body, providers.Usage{}, nil, latency, http.StatusBadGateway, []byte(`{"error":"upstream request failed"}`), false, project, sessionID, overridden, budgetReserved)
 		http.Error(w, `{"error":"upstream request failed"}`, http.StatusBadGateway)
 		return
 	}
@@ -80,7 +84,9 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, provider 
 	})
 	defer idleTimer.Stop()
 
-	// If the upstream returned a non-streaming response (e.g., error), pass it through directly
+	// If the upstream returned a non-streaming response (e.g., error), pass it through directly.
+	// Still record budget + WAL so the audit trail is complete even for non-SSE responses
+	// that arrive on the streaming path (e.g., 4xx/5xx errors from the provider).
 	contentType := resp.Header.Get("Content-Type")
 	if !strings.Contains(contentType, "text/event-stream") {
 		cap := h.MaxResponseBody
@@ -89,10 +95,20 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, provider 
 		}
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, cap+1))
 		if int64(len(respBody)) > cap {
+			latency := time.Since(start)
 			log.Warn().Int64("cap", cap).Msg("upstream non-SSE response exceeded body cap — truncated")
+			h.finalizeRequest(r.Context(), provider.Name, body, providers.Usage{}, nil, latency, http.StatusBadGateway, []byte(`{"error":"upstream response too large"}`), false, project, sessionID, overridden, budgetReserved)
 			http.Error(w, `{"error":"upstream response too large"}`, http.StatusBadGateway)
 			return
 		}
+		latency := time.Since(start)
+
+		var usage providers.Usage
+		if provider.ExtractUsage != nil {
+			usage, _ = provider.ExtractUsage(respBody)
+		}
+		h.finalizeRequest(r.Context(), provider.Name, body, usage, nil, latency, resp.StatusCode, respBody, false, project, sessionID, overridden, budgetReserved)
+
 		copyHeaders(resp.Header, w.Header())
 		w.WriteHeader(resp.StatusCode)
 		w.Write(respBody)
@@ -136,7 +152,7 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, provider 
 				}
 
 				// Keep tool_call-relevant events for tool extraction
-				if isToolCallRelevantEvent(provider.Name, currentEvent) {
+				if isToolCallRelevantEvent(provider.Name, currentEvent) && len(toolCallEvents) < maxToolCallEvents {
 					toolCallEvents = append(toolCallEvents, currentEvent)
 				}
 
@@ -179,10 +195,17 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, provider 
 		}
 	}
 
-	// Log stream read errors (includes idle timeout termination)
+	// Log stream read errors (includes idle timeout and total deadline termination)
 	if err := scanner.Err(); err != nil {
-		if ctx.Err() != nil {
-			log.Warn().Str("provider", provider.Name).Msg("stream terminated by idle timeout")
+		if err == bufio.ErrTooLong {
+			log.Warn().Str("provider", provider.Name).Msg("SSE line too long — closing stream")
+			writeSSEEvent(w, providers.SSEEvent{
+				Event: "error",
+				Data:  `{"error":"SSE line too long"}`,
+			})
+			flusher.Flush()
+		} else if ctx.Err() != nil {
+			log.Warn().Str("provider", provider.Name).Msg("stream terminated by idle or total timeout")
 		} else {
 			log.Warn().Err(err).Str("provider", provider.Name).Msg("stream read error")
 		}
@@ -193,7 +216,7 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, provider 
 		if isUsageRelevantEvent(provider.Name, currentEvent, len(usageEvents) == 0) {
 			usageEvents = append(usageEvents, currentEvent)
 		}
-		if isToolCallRelevantEvent(provider.Name, currentEvent) {
+		if isToolCallRelevantEvent(provider.Name, currentEvent) && len(toolCallEvents) < maxToolCallEvents {
 			toolCallEvents = append(toolCallEvents, currentEvent)
 		}
 
@@ -226,7 +249,7 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, provider 
 	}
 
 	// Finalize: compute cost, normalization, loop detection, and write WAL
-	h.finalizeRequest(r.Context(), provider.Name, body, usage, toolCalls, latency, resp.StatusCode, true, project, sessionID)
+	h.finalizeRequest(r.Context(), provider.Name, body, usage, toolCalls, latency, resp.StatusCode, nil, true, project, sessionID, overridden, budgetReserved)
 }
 
 // isUsageRelevantEvent returns true if this event should be kept for usage
@@ -266,6 +289,8 @@ func isToolCallRelevantEvent(providerName string, ev providers.SSEEvent) bool {
 	case "anthropic":
 		// Anthropic tool_use arrives via content_block_start and content_block_delta
 		return ev.Event == "content_block_start" || ev.Event == "content_block_delta"
+	case "gemini":
+		return strings.Contains(ev.Data, "functionCall")
 	default:
 		return false
 	}

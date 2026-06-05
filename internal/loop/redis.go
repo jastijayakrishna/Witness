@@ -37,16 +37,17 @@ func stateKey(project, sessionID string) string {
 func (ss *StateStore) Load(ctx context.Context, project, sessionID string) (State, error) {
 	data, err := ss.rdb.Get(ctx, stateKey(project, sessionID)).Bytes()
 	if err == redis.Nil {
-		return State{}, nil
+		return NewState(), nil
 	}
 	if err != nil {
-		return State{}, fmt.Errorf("redis get loop state: %w", err)
+		return NewState(), fmt.Errorf("redis get loop state: %w", err)
 	}
 
 	var s State
 	if err := json.Unmarshal(data, &s); err != nil {
-		return State{}, fmt.Errorf("unmarshal loop state: %w", err)
+		return NewState(), fmt.Errorf("unmarshal loop state: %w", err)
 	}
+	s.ensureInit()
 	return s, nil
 }
 
@@ -80,13 +81,14 @@ func (ss *StateStore) Transact(ctx context.Context, project, sessionID string, f
 			data, err := tx.Get(ctx, key).Bytes()
 			var state State
 			if err == redis.Nil {
-				state = State{}
+				state = NewState()
 			} else if err != nil {
 				return fmt.Errorf("redis get in transact: %w", err)
 			} else {
 				if err := json.Unmarshal(data, &state); err != nil {
-					state = State{} // corrupted state — reset
+					state = NewState() // corrupted state — reset
 				}
+				state.ensureInit()
 			}
 
 			// Apply the pure function (detector logic, no I/O)

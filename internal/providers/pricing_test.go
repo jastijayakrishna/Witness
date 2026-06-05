@@ -86,6 +86,42 @@ func TestComputeCost_AllModelsNonZero(t *testing.T) {
 	}
 }
 
+func TestPricing_CurrentGeminiModelsKnown(t *testing.T) {
+	models := []string{
+		"gemini-3-pro-preview",
+		"gemini-3-flash-preview",
+		"gemini-2.5-pro",
+		"gemini-2.5-flash",
+		"gemini-2.5-flash-preview-09-2025",
+		"gemini-2.5-flash-lite",
+		"gemini-2.5-flash-lite-preview-09-2025",
+		"gemini-flash-latest",
+		"gemini-flash-lite-latest",
+	}
+	for _, model := range models {
+		if !HasPricing(model) {
+			t.Fatalf("missing pricing for current Gemini model %q", model)
+		}
+		if cost := ComputeCost(model, 1000, 1000); cost <= 0 {
+			t.Fatalf("model %q cost=%f want >0", model, cost)
+		}
+	}
+}
+
+func TestPricing_DeprecatedGeminiModelsFlagged(t *testing.T) {
+	models := []string{
+		"gemini-2.0-flash",
+		"gemini-2.0-flash-001",
+		"gemini-2.0-flash-lite",
+		"gemini-2.0-flash-lite-001",
+	}
+	for _, model := range models {
+		if DeprecationNotice(model) == "" {
+			t.Fatalf("deprecated Gemini model %q is not flagged", model)
+		}
+	}
+}
+
 // Verify relative pricing makes sense (sanity checks)
 func TestPricingRelativeOrder(t *testing.T) {
 	// GPT-4 should be more expensive than GPT-4o

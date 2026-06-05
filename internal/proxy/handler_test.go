@@ -691,9 +691,9 @@ func TestHandler_LoopDetection_PopulatesWALFields(t *testing.T) {
 	if wr.LoopConfidence != 0 {
 		t.Errorf("first turn confidence = %f, want 0", wr.LoopConfidence)
 	}
-	// Action should be "none" (effective = min(shadow, none) = none)
-	if wr.LoopAction != "" && wr.LoopAction != "none" {
-		t.Errorf("first turn action = %q, want empty or none", wr.LoopAction)
+	// In shadow mode, first turn (no signals) records "shadow" to indicate detector ran
+	if wr.LoopAction != "" && wr.LoopAction != "none" && wr.LoopAction != "shadow" {
+		t.Errorf("first turn action = %q, want empty, none, or shadow", wr.LoopAction)
 	}
 }
 

@@ -33,9 +33,12 @@ func TestStateStore_LoadMiss(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load miss returned error: %v", err)
 	}
-	// Empty state expected
-	if len(state.CallHistory) != 0 || len(state.CostEvents) != 0 {
-		t.Error("Load miss should return empty state")
+	// Empty state expected — ring buffers initialized but empty
+	if state.CallHistory == nil || state.CallHistory.len != 0 {
+		t.Error("Load miss should return empty initialized state")
+	}
+	if state.CostWindow == nil {
+		t.Error("Load miss should return initialized CostWindow")
 	}
 }
 
@@ -43,13 +46,17 @@ func TestStateStore_SaveAndLoad(t *testing.T) {
 	store, _ := newTestStore(t)
 	ctx := context.Background()
 
-	original := State{
-		CallHistory:   []callKey{{Tool: "bash", ArgsHash: "abc123"}, {Tool: "read", ArgsHash: "def456"}},
-		ResultHistory: []resultKey{{Tool: "bash", ResultHash: "res1"}},
-		ContextSizes:  []int{100, 200, 300},
-		OutputSizes:   []int{50, 60},
-		CostEvents:    []costEvent{{T: 1700000000000, Cost: 0.01}, {T: 1700000060000, Cost: 0.02}},
-	}
+	original := NewState()
+	original.CallHistory.push(callKey{Tool: "bash", ArgsHash: "abc123"})
+	original.CallHistory.push(callKey{Tool: "read", ArgsHash: "def456"})
+	original.ResultHistory.push(resultKey{Tool: "bash", ResultHash: "res1"})
+	original.ContextSizes.push(100)
+	original.ContextSizes.push(200)
+	original.ContextSizes.push(300)
+	original.OutputSizes.push(50)
+	original.OutputSizes.push(60)
+	original.CostWindow.add(1700000000000, 0.01)
+	original.CostWindow.add(1700000060000, 0.02)
 
 	if err := store.Save(ctx, "proj", "sess-1", original); err != nil {
 		t.Fatalf("Save: %v", err)
@@ -61,26 +68,23 @@ func TestStateStore_SaveAndLoad(t *testing.T) {
 	}
 
 	// Verify all fields roundtrip
-	if len(loaded.CallHistory) != 2 {
-		t.Fatalf("CallHistory len = %d, want 2", len(loaded.CallHistory))
+	if loaded.CallHistory.len != 2 {
+		t.Fatalf("CallHistory len = %d, want 2", loaded.CallHistory.len)
 	}
-	if loaded.CallHistory[0].Tool != "bash" || loaded.CallHistory[0].ArgsHash != "abc123" {
-		t.Errorf("CallHistory[0] = %v", loaded.CallHistory[0])
+	if loaded.CallHistory.get(0).Tool != "bash" || loaded.CallHistory.get(0).ArgsHash != "abc123" {
+		t.Errorf("CallHistory[0] = %v", loaded.CallHistory.get(0))
 	}
-	if loaded.CallHistory[1].Tool != "read" || loaded.CallHistory[1].ArgsHash != "def456" {
-		t.Errorf("CallHistory[1] = %v", loaded.CallHistory[1])
+	if loaded.CallHistory.get(1).Tool != "read" || loaded.CallHistory.get(1).ArgsHash != "def456" {
+		t.Errorf("CallHistory[1] = %v", loaded.CallHistory.get(1))
 	}
-	if len(loaded.ResultHistory) != 1 || loaded.ResultHistory[0].Tool != "bash" {
-		t.Errorf("ResultHistory = %v", loaded.ResultHistory)
+	if loaded.ResultHistory.len != 1 || loaded.ResultHistory.get(0).Tool != "bash" {
+		t.Errorf("ResultHistory unexpected: len=%d", loaded.ResultHistory.len)
 	}
-	if len(loaded.ContextSizes) != 3 || loaded.ContextSizes[2] != 300 {
-		t.Errorf("ContextSizes = %v", loaded.ContextSizes)
+	if loaded.ContextSizes.len != 3 || loaded.ContextSizes.get(2) != 300 {
+		t.Errorf("ContextSizes unexpected: len=%d", loaded.ContextSizes.len)
 	}
-	if len(loaded.OutputSizes) != 2 || loaded.OutputSizes[1] != 60 {
-		t.Errorf("OutputSizes = %v", loaded.OutputSizes)
-	}
-	if len(loaded.CostEvents) != 2 || loaded.CostEvents[1].Cost != 0.02 {
-		t.Errorf("CostEvents = %v", loaded.CostEvents)
+	if loaded.OutputSizes.len != 2 || loaded.OutputSizes.get(1) != 60 {
+		t.Errorf("OutputSizes unexpected: len=%d", loaded.OutputSizes.len)
 	}
 }
 
@@ -88,8 +92,10 @@ func TestStateStore_IsolatedBySession(t *testing.T) {
 	store, _ := newTestStore(t)
 	ctx := context.Background()
 
-	s1 := State{CallHistory: []callKey{{Tool: "bash", ArgsHash: "aaa"}}}
-	s2 := State{CallHistory: []callKey{{Tool: "read", ArgsHash: "bbb"}}}
+	s1 := NewState()
+	s1.CallHistory.push(callKey{Tool: "bash", ArgsHash: "aaa"})
+	s2 := NewState()
+	s2.CallHistory.push(callKey{Tool: "read", ArgsHash: "bbb"})
 
 	store.Save(ctx, "proj", "sess-1", s1)
 	store.Save(ctx, "proj", "sess-2", s2)
@@ -97,11 +103,11 @@ func TestStateStore_IsolatedBySession(t *testing.T) {
 	loaded1, _ := store.Load(ctx, "proj", "sess-1")
 	loaded2, _ := store.Load(ctx, "proj", "sess-2")
 
-	if loaded1.CallHistory[0].Tool != "bash" {
-		t.Errorf("sess-1 contaminated: got tool %q", loaded1.CallHistory[0].Tool)
+	if loaded1.CallHistory.get(0).Tool != "bash" {
+		t.Errorf("sess-1 contaminated: got tool %q", loaded1.CallHistory.get(0).Tool)
 	}
-	if loaded2.CallHistory[0].Tool != "read" {
-		t.Errorf("sess-2 contaminated: got tool %q", loaded2.CallHistory[0].Tool)
+	if loaded2.CallHistory.get(0).Tool != "read" {
+		t.Errorf("sess-2 contaminated: got tool %q", loaded2.CallHistory.get(0).Tool)
 	}
 }
 
@@ -109,7 +115,8 @@ func TestStateStore_TTL(t *testing.T) {
 	store, mr := newTestStore(t)
 	ctx := context.Background()
 
-	state := State{CallHistory: []callKey{{Tool: "bash", ArgsHash: "x"}}}
+	state := NewState()
+	state.CallHistory.push(callKey{Tool: "bash", ArgsHash: "x"})
 	store.Save(ctx, "proj", "sess", state)
 
 	// Verify TTL was set
@@ -128,7 +135,7 @@ func TestStateStore_TTL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load after TTL: %v", err)
 	}
-	if len(loaded.CallHistory) != 0 {
+	if loaded.CallHistory.len != 0 {
 		t.Error("state should have expired after TTL")
 	}
 }
@@ -138,22 +145,20 @@ func TestStateStore_OverwriteUpdatesState(t *testing.T) {
 	ctx := context.Background()
 
 	// Save initial state
-	s1 := State{CallHistory: []callKey{{Tool: "bash", ArgsHash: "v1"}}}
+	s1 := NewState()
+	s1.CallHistory.push(callKey{Tool: "bash", ArgsHash: "v1"})
 	store.Save(ctx, "proj", "sess", s1)
 
 	// Overwrite with new state
-	s2 := State{
-		CallHistory: []callKey{{Tool: "bash", ArgsHash: "v1"}, {Tool: "bash", ArgsHash: "v2"}},
-		CostEvents:  []costEvent{{T: 1700000000000, Cost: 0.05}},
-	}
+	s2 := NewState()
+	s2.CallHistory.push(callKey{Tool: "bash", ArgsHash: "v1"})
+	s2.CallHistory.push(callKey{Tool: "bash", ArgsHash: "v2"})
+	s2.CostWindow.add(1700000000000, 0.05)
 	store.Save(ctx, "proj", "sess", s2)
 
 	loaded, _ := store.Load(ctx, "proj", "sess")
-	if len(loaded.CallHistory) != 2 {
-		t.Errorf("CallHistory len = %d after overwrite, want 2", len(loaded.CallHistory))
-	}
-	if len(loaded.CostEvents) != 1 {
-		t.Errorf("CostEvents len = %d after overwrite, want 1", len(loaded.CostEvents))
+	if loaded.CallHistory.len != 2 {
+		t.Errorf("CallHistory len = %d after overwrite, want 2", loaded.CallHistory.len)
 	}
 }
 
@@ -170,7 +175,7 @@ func TestStateStore_FullRoundtripWithDetector(t *testing.T) {
 		UnixMillis: 1700000000000,
 	}
 
-	state := State{}
+	state := NewState()
 	state, _ = Observe(state, obs1, cfg)
 
 	// Persist
@@ -194,8 +199,8 @@ func TestStateStore_FullRoundtripWithDetector(t *testing.T) {
 	loaded, dec := Observe(loaded, obs2, cfg)
 
 	// Should have 2 entries in call history
-	if len(loaded.CallHistory) != 2 {
-		t.Errorf("CallHistory len = %d after roundtrip, want 2", len(loaded.CallHistory))
+	if loaded.CallHistory.len != 2 {
+		t.Errorf("CallHistory len = %d after roundtrip, want 2", loaded.CallHistory.len)
 	}
 	// Second observation alone shouldn't trigger any signals
 	if len(dec.SignalsFired) != 0 {

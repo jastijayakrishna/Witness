@@ -23,8 +23,15 @@ type ModelPricing struct {
 	OutputPerToken float64
 }
 
+var DeprecatedModels = map[string]string{
+	"gemini-2.0-flash":          "deprecated and shut down June 1, 2026; migrate to Gemini 2.5 or 3",
+	"gemini-2.0-flash-001":      "deprecated and shut down June 1, 2026; migrate to Gemini 2.5 or 3",
+	"gemini-2.0-flash-lite":     "deprecated and shut down June 1, 2026; migrate to Gemini 2.5 or 3",
+	"gemini-2.0-flash-lite-001": "deprecated and shut down June 1, 2026; migrate to Gemini 2.5 or 3",
+}
+
 // PricingTable maps model names to their per-token costs.
-// Prices in USD. Updated as of early 2025.
+// Prices in USD per token. Keep current with provider pricing docs.
 var PricingTable = map[string]ModelPricing{
 	// OpenAI
 	"gpt-4o":                 {InputPerToken: 2.50 / 1_000_000, OutputPerToken: 10.00 / 1_000_000},
@@ -51,12 +58,36 @@ var PricingTable = map[string]ModelPricing{
 	"claude-3-haiku-20240307":    {InputPerToken: 0.25 / 1_000_000, OutputPerToken: 1.25 / 1_000_000},
 	"claude-sonnet-4-20250514":   {InputPerToken: 3.00 / 1_000_000, OutputPerToken: 15.00 / 1_000_000},
 	"claude-haiku-4-20250514":    {InputPerToken: 0.80 / 1_000_000, OutputPerToken: 4.00 / 1_000_000},
+
+	// Google Gemini
+	"gemini-1.5-pro":                        {InputPerToken: 1.25 / 1_000_000, OutputPerToken: 5.00 / 1_000_000},
+	"gemini-1.5-pro-001":                    {InputPerToken: 1.25 / 1_000_000, OutputPerToken: 5.00 / 1_000_000},
+	"gemini-1.5-pro-002":                    {InputPerToken: 1.25 / 1_000_000, OutputPerToken: 5.00 / 1_000_000},
+	"gemini-1.5-flash":                      {InputPerToken: 0.075 / 1_000_000, OutputPerToken: 0.30 / 1_000_000},
+	"gemini-1.5-flash-001":                  {InputPerToken: 0.075 / 1_000_000, OutputPerToken: 0.30 / 1_000_000},
+	"gemini-1.5-flash-002":                  {InputPerToken: 0.075 / 1_000_000, OutputPerToken: 0.30 / 1_000_000},
+	"gemini-2.5-pro":                        {InputPerToken: 1.25 / 1_000_000, OutputPerToken: 10.00 / 1_000_000},
+	"gemini-2.5-flash":                      {InputPerToken: 0.30 / 1_000_000, OutputPerToken: 2.50 / 1_000_000},
+	"gemini-2.5-flash-preview-09-2025":      {InputPerToken: 0.30 / 1_000_000, OutputPerToken: 2.50 / 1_000_000},
+	"gemini-2.5-flash-lite":                 {InputPerToken: 0.10 / 1_000_000, OutputPerToken: 0.40 / 1_000_000},
+	"gemini-2.5-flash-lite-preview-09-2025": {InputPerToken: 0.10 / 1_000_000, OutputPerToken: 0.40 / 1_000_000},
+	"gemini-3-pro-preview":                  {InputPerToken: 2.00 / 1_000_000, OutputPerToken: 12.00 / 1_000_000},
+	"gemini-3-flash-preview":                {InputPerToken: 0.50 / 1_000_000, OutputPerToken: 3.00 / 1_000_000},
+	"gemini-2.0-flash":                      {InputPerToken: 0.10 / 1_000_000, OutputPerToken: 0.40 / 1_000_000},
+	"gemini-2.0-flash-001":                  {InputPerToken: 0.10 / 1_000_000, OutputPerToken: 0.40 / 1_000_000},
+	"gemini-2.0-flash-exp":                  {InputPerToken: 0.10 / 1_000_000, OutputPerToken: 0.40 / 1_000_000},
+	"gemini-2.0-flash-lite":                 {InputPerToken: 0.075 / 1_000_000, OutputPerToken: 0.30 / 1_000_000},
+	"gemini-2.0-flash-lite-001":             {InputPerToken: 0.075 / 1_000_000, OutputPerToken: 0.30 / 1_000_000},
+	"gemini-flash-latest":                   {InputPerToken: 0.30 / 1_000_000, OutputPerToken: 2.50 / 1_000_000},
+	"gemini-flash-lite-latest":              {InputPerToken: 0.10 / 1_000_000, OutputPerToken: 0.40 / 1_000_000},
+	"gemini-pro":                            {InputPerToken: 0.50 / 1_000_000, OutputPerToken: 1.50 / 1_000_000},
+	"gemini-pro-vision":                     {InputPerToken: 0.50 / 1_000_000, OutputPerToken: 1.50 / 1_000_000},
 }
 
 // ComputeCost calculates the USD cost for a given model and token counts.
 // Logs a warning and returns 0 if the model is not found in the pricing table.
 func ComputeCost(model string, inputTokens, outputTokens int) float64 {
-	p, ok := PricingTable[model]
+	p, ok := PricingFor(model)
 	if !ok {
 		if model != "" {
 			unknownModelTotal.WithLabelValues(model).Inc()
@@ -65,4 +96,18 @@ func ComputeCost(model string, inputTokens, outputTokens int) float64 {
 		return 0
 	}
 	return float64(inputTokens)*p.InputPerToken + float64(outputTokens)*p.OutputPerToken
+}
+
+func PricingFor(model string) (ModelPricing, bool) {
+	p, ok := PricingTable[model]
+	return p, ok
+}
+
+func HasPricing(model string) bool {
+	_, ok := PricingFor(model)
+	return ok
+}
+
+func DeprecationNotice(model string) string {
+	return DeprecatedModels[model]
 }

@@ -60,38 +60,60 @@ func newULID() string {
 // Phase 2: Hash chain fields for tamper-evident audit log.
 // Phase 1/2: Session ID, tool signature, args fingerprint, and loop detection fields.
 type Record struct {
-	ID              string    `json:"id,omitempty"`
-	Time            time.Time `json:"time"`
-	Project         string    `json:"project"`
-	Provider        string    `json:"provider"`
-	Model           string    `json:"model"`
-	PromptHash      string    `json:"prompt_hash"`
-	InputTokens     int       `json:"input_tokens"`
-	OutputTokens    int       `json:"output_tokens"`
-	TotalTokens     int       `json:"total_tokens"`
-	Cost            float64   `json:"cost"`
-	LatencyMs       int64     `json:"latency_ms"`
-	StatusCode      int       `json:"status_code"`
-	CacheHit        bool      `json:"cache_hit"`
-	Stream          bool      `json:"stream"`
-	SessionID       string    `json:"session_id,omitempty"`        // Phase 1: X-Session-ID for loop safety floor
-	ToolSignature   string    `json:"tool_signature,omitempty"`    // Phase 2: first tool call name
-	ArgsFingerprint string    `json:"args_fingerprint,omitempty"`  // Phase 2: SHA256(normalized canonical args)
-	LoopSignalsFired string   `json:"loop_signals_fired,omitempty"` // Phase 3: comma-separated fired signals
-	LoopConfidence  float64   `json:"loop_confidence,omitempty"`   // Phase 3: detector confidence score
-	LoopAction      string    `json:"loop_action,omitempty"`       // Phase 3: shadow/warn/block
-	PrevHash        string    `json:"prev_hash"`                   // Phase 2: hash of previous record
-	RecordHash      string    `json:"record_hash"`                 // Phase 2: hash of this record
-	ChainRestart    bool      `json:"chain_restart,omitempty"`     // Phase 2: crash recovery marker
+	ID               string    `json:"id,omitempty"`
+	Time             time.Time `json:"time"`
+	Project          string    `json:"project"`
+	Provider         string    `json:"provider"`
+	Model            string    `json:"model"`
+	PromptHash       string    `json:"prompt_hash"`
+	InputTokens      int       `json:"input_tokens"`
+	OutputTokens     int       `json:"output_tokens"`
+	TotalTokens      int       `json:"total_tokens"`
+	Cost             float64   `json:"cost"`
+	LatencyMs        int64     `json:"latency_ms"`
+	StatusCode       int       `json:"status_code"`
+	CacheHit         bool      `json:"cache_hit"`
+	Stream           bool      `json:"stream"`
+	SessionID        string    `json:"session_id,omitempty"`       // Phase 1: X-Session-ID for loop safety floor
+	ToolSignature    string    `json:"tool_signature,omitempty"`   // Phase 2: first tool call name
+	ArgsFingerprint  string    `json:"args_fingerprint,omitempty"` // Phase 2: SHA256(normalized canonical args)
+	StepID           string    `json:"step_id,omitempty"`
+	ResultClass      string    `json:"result_class,omitempty"`
+	StateDeltaHash   string    `json:"state_delta_hash,omitempty"`
+	DecisionStage    string    `json:"decision_stage,omitempty"`
+	LoopSignalsFired string    `json:"loop_signals_fired,omitempty"` // Phase 3: comma-separated fired signals
+	LoopConfidence   float64   `json:"loop_confidence,omitempty"`    // Phase 3: detector confidence score
+	LoopAction       string    `json:"loop_action,omitempty"`        // Phase 3: shadow/warn/block
+	LoopEvidence     string    `json:"loop_evidence,omitempty"`
+	PrevHash         string    `json:"prev_hash"`               // Phase 2: hash of previous record
+	RecordHash       string    `json:"record_hash"`             // Phase 2: hash of this record
+	ChainRestart     bool      `json:"chain_restart,omitempty"` // Phase 2: crash recovery marker
 
 	// v5.2 moat hooks — cheap now, impossible to retrofit later.
 	// Every record carries these from day 1 so replay, training, and
 	// auditing pipelines can always reconstruct who decided what and why.
-	TrajectoryID    string   `json:"trajectory_id,omitempty"`    // UUID per session — groups a run into one trajectory
-	DetectorVersion string   `json:"detector_version,omitempty"` // loop.DetectorVersion — which algo made this call
-	Framework       string   `json:"framework,omitempty"`        // detected agent framework (langchain/crewai/unknown)
-	NearMiss        bool     `json:"near_miss,omitempty"`        // confidence 0.50–0.69 — valuable training signal
-	ImmediateOutcome string  `json:"immediate_outcome,omitempty"` // success/blocked/error — set by handler
+	TrajectoryID     string `json:"trajectory_id,omitempty"`     // UUID per session — groups a run into one trajectory
+	DetectorVersion  string `json:"detector_version,omitempty"`  // loop.DetectorVersion — which algo made this call
+	Framework        string `json:"framework,omitempty"`         // detected agent framework (langchain/crewai/unknown)
+	NearMiss         bool   `json:"near_miss,omitempty"`         // confidence 0.50–0.69 — valuable training signal
+	ImmediateOutcome string `json:"immediate_outcome,omitempty"` // success/blocked/error — set by handler
+	DecisionID       string `json:"decision_id,omitempty"`
+	AgentID          string `json:"agent_id,omitempty"`
+	UserID           string `json:"user_id,omitempty"`
+	ActionRisk       string `json:"action_risk,omitempty"`
+	IdempotencyKey   string `json:"idempotency_key,omitempty"`
+	ResourceID       string `json:"resource_id,omitempty"`
+	AmountCents      int64  `json:"amount_cents,omitempty"`
+	MaxAmountCents   int64  `json:"max_amount_cents,omitempty"`
+	BackupID         string `json:"backup_id,omitempty"`
+	RecipientDomain  string `json:"recipient_domain,omitempty"`
+	AllowedDomain    string `json:"allowed_domain,omitempty"`
+	CapabilityHash   string `json:"capability_hash,omitempty"`
+	PolicyVersion    string `json:"policy_version,omitempty"`
+	DecisionReason   string `json:"decision_reason,omitempty"`
+	DecisionEvidence string `json:"decision_evidence,omitempty"`
+	ReceiptSignature string `json:"receipt_signature,omitempty"`
+	ReceiptKeyID     string `json:"receipt_key_id,omitempty"`
 }
 
 // SyncMode constants for WAL writer fsync behavior.
@@ -217,7 +239,9 @@ func (w *Writer) Write(rec Record) error {
 	}
 
 	// Phase 2: Apply hash chaining
-	Chain(&rec, w.lastHash)
+	if err := Chain(&rec, w.lastHash); err != nil {
+		return fmt.Errorf("chain record: %w", err)
+	}
 
 	line, err := json.Marshal(rec)
 	if err != nil {
@@ -307,7 +331,9 @@ func (w *Writer) writeChainRestartMarkerLocked() error {
 		Model:        "_restart",
 		ChainRestart: true,
 	}
-	Chain(&marker, w.lastHash)
+	if err := Chain(&marker, w.lastHash); err != nil {
+		return fmt.Errorf("chain restart marker: %w", err)
+	}
 
 	line, err := json.Marshal(marker)
 	if err != nil {

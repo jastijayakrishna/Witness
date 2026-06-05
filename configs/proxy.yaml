@@ -29,3 +29,11 @@ loop_detection:
   warn_confidence: 0.40
   block_confidence: 0.70
   require_session_for_block: true
+
+budget:
+  daily_soft_usd: 0            # 0 = disabled. Soft limit triggers warning.
+  daily_hard_usd: 50.0         # Hard limit triggers 429 block. The seatbelt.
+  reserve_per_request_usd: 0.50  # Atomic reservation per request to prevent concurrent overshoot.
+
+alerts:
+  webhook_url: ""              # Slack/webhook URL for loop alerts. Empty = disabled.

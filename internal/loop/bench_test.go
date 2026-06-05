@@ -11,7 +11,7 @@ func BenchmarkObserve_Runaway(b *testing.B) {
 
 	b.ResetTimer()
 	for range b.N {
-		s := State{}
+		s := NewState()
 		for _, o := range obs {
 			s, _ = Observe(s, o, cfg)
 		}
@@ -27,7 +27,7 @@ func BenchmarkObserve_Batch(b *testing.B) {
 
 	b.ResetTimer()
 	for range b.N {
-		s := State{}
+		s := NewState()
 		for _, o := range obs {
 			s, _ = Observe(s, o, cfg)
 		}
@@ -42,7 +42,7 @@ func BenchmarkObserve_500Calls(b *testing.B) {
 
 	b.ResetTimer()
 	for range b.N {
-		s := State{}
+		s := NewState()
 		for _, o := range obs {
 			s, _ = Observe(s, o, cfg)
 		}

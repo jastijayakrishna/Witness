@@ -4,7 +4,7 @@ import "testing"
 
 // feed runs a sequence of observations through a fresh state and returns the final decision.
 func feed(cfg Config, obs []Observation) (State, Decision) {
-	s := State{}
+	s := NewState()
 	var d Decision
 	for _, o := range obs {
 		s, d = Observe(s, o, cfg)
@@ -14,7 +14,7 @@ func feed(cfg Config, obs []Observation) (State, Decision) {
 
 // feedAll runs a sequence and returns ALL decisions (one per observation).
 func feedAll(cfg Config, obs []Observation) []Decision {
-	s := State{}
+	s := NewState()
 	var ds []Decision
 	for _, o := range obs {
 		var d Decision
@@ -88,6 +88,34 @@ func makeAlternating(n int, sessionID string) []Observation {
 		cost = cost * 1.4
 	}
 	return out
+}
+
+// --- Decide returns the same verdict as Observe without mutating state. ---
+func TestDecideMatchesObserve(t *testing.T) {
+	cfg := DefaultConfig()
+	obs := makeRunaway(8, "decide-test")
+
+	// Build up state with 7 observations
+	s := NewState()
+	for _, o := range obs[:7] {
+		s, _ = Observe(s, o, cfg)
+	}
+
+	// 8th observation: compare Decide (read-only) vs Observe
+	last := obs[7]
+	decideResult := Decide(s, last, cfg)
+	_, observeResult := Observe(s, last, cfg)
+
+	if decideResult.Confidence != observeResult.Confidence {
+		t.Fatalf("Decide confidence=%.4f != Observe confidence=%.4f", decideResult.Confidence, observeResult.Confidence)
+	}
+	if decideResult.ActionCeiling != observeResult.ActionCeiling {
+		t.Fatalf("Decide ceiling=%s != Observe ceiling=%s", decideResult.ActionCeiling, observeResult.ActionCeiling)
+	}
+	if len(decideResult.SignalsFired) != len(observeResult.SignalsFired) {
+		t.Fatalf("Decide signals=%v != Observe signals=%v", decideResult.SignalsFired, observeResult.SignalsFired)
+	}
+	t.Logf("OK: Decide matches Observe. confidence=%.2f ceiling=%s", decideResult.Confidence, decideResult.ActionCeiling)
 }
 
 // --- The test that SELLS the product: legitimate batch is NEVER blocked, even with action:block. ---
@@ -190,6 +218,72 @@ func TestDeterministic(t *testing.T) {
 		t.Fatalf("FAIL: non-deterministic. %v vs %v", d1, d2)
 	}
 	t.Logf("OK: deterministic. confidence=%.2f", d1.Confidence)
+}
+
+// --- Flat-cost runaway blocked via pre-request empty-observation gate. ---
+// This is the proof that checkLoop (pre-request, empty obs) correctly blocks
+// turn N+1 of a flat-cost runaway via sustained_repetition + deepQualifies.
+func TestFlatCostRunaway_EmptyObsGateBlocks(t *testing.T) {
+	cfg := Config{
+		Action:                 "block",
+		MaxRepeated:            3,
+		VelocityAccelRatio:     1.5,
+		VelocityWindowMs:       1_000, // 1s → minSpan = 100ms
+		WarnConfidence:         0.40,
+		BlockConfidence:        0.70,
+		RequireSessionForBlock: true,
+	}
+
+	// Build 8 identical flat-cost calls spanning 200ms each (total 1600ms > minSpan=100ms).
+	// This simulates 8 observeLoop post-request updates.
+	s := NewState()
+	t0 := int64(1_000_000) // arbitrary start time
+	for i := 0; i < 8; i++ {
+		obs := Observation{
+			Project:      "p",
+			SessionID:    "stuck-session",
+			ToolName:     "search",
+			Args:         map[string]any{"query": "fix"},       // identical every time
+			Result:       map[string]any{"error": "not found"}, // identical result
+			PromptTokens: 100, OutputTokens: 10,                // flat
+			CostUSD:      0.01,              // flat cost — NO acceleration
+			UnixMillis:   t0 + int64(i)*200, // 200ms apart
+		}
+		s, _ = Observe(s, obs, cfg)
+	}
+
+	// Now simulate the pre-request check: empty observation (no tool, no cost).
+	// This is exactly what handler.checkLoop does before forwarding the request.
+	emptyObs := Observation{
+		Project:    "p",
+		SessionID:  "stuck-session",
+		UnixMillis: t0 + 8*200, // time of the would-be 9th request
+	}
+	_, decision := Observe(s, emptyObs, cfg)
+
+	// Assert: the empty-obs check reaches BLOCK ceiling
+	if decision.ActionCeiling != ActionBlock {
+		t.Fatalf("FAIL: flat-cost runaway with empty-obs gate did not reach BLOCK.\n"+
+			"  ceiling=%s confidence=%.2f signals=%v reason=%q",
+			decision.ActionCeiling, decision.Confidence, decision.SignalsFired, decision.Reason)
+	}
+	if decision.Confidence < 0.70 {
+		t.Fatalf("FAIL: confidence %.2f below block threshold 0.70", decision.Confidence)
+	}
+
+	// Verify sustained_repetition fired (this is what makes flat-cost blocking possible)
+	hasSustained := false
+	for _, sig := range decision.SignalsFired {
+		if sig == "sustained_repetition" {
+			hasSustained = true
+		}
+	}
+	if !hasSustained {
+		t.Fatalf("FAIL: sustained_repetition did not fire. signals=%v", decision.SignalsFired)
+	}
+
+	t.Logf("OK: flat-cost runaway blocked by empty-obs gate. confidence=%.2f signals=%v",
+		decision.Confidence, decision.SignalsFired)
 }
 
 // --- A bursty-but-legitimate job (changing args, one cost bump, then flat) stays sub-block. ---

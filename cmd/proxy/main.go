@@ -20,10 +20,12 @@ import (
 
 	"github.com/witness-proxy/witness-proxy/internal/config"
 	"github.com/witness-proxy/witness-proxy/internal/loop"
-	_ "github.com/witness-proxy/witness-proxy/internal/providers" // register providers via init()
+	"github.com/witness-proxy/witness-proxy/internal/providers"
 	"github.com/witness-proxy/witness-proxy/internal/proxy"
+	"github.com/witness-proxy/witness-proxy/internal/receipts"
 	"github.com/witness-proxy/witness-proxy/internal/storage"
 	"github.com/witness-proxy/witness-proxy/internal/wal"
+	"net/url"
 )
 
 var (
@@ -65,6 +67,24 @@ func main() {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to load config")
+	}
+
+	// Override provider targets from env vars (for testing/dev with mock servers)
+	if targetURL := os.Getenv("WITNESS_OPENAI_TARGET"); targetURL != "" {
+		if u, err := url.Parse(targetURL); err == nil {
+			if p := providers.Registry["/openai"]; p != nil {
+				p.Target = u
+				log.Info().Str("target", targetURL).Msg("OpenAI target overridden")
+			}
+		}
+	}
+	if targetURL := os.Getenv("WITNESS_ANTHROPIC_TARGET"); targetURL != "" {
+		if u, err := url.Parse(targetURL); err == nil {
+			if p := providers.Registry["/anthropic"]; p != nil {
+				p.Target = u
+				log.Info().Str("target", targetURL).Msg("Anthropic target overridden")
+			}
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -138,8 +158,46 @@ func main() {
 		RequireSessionForBlock: cfg.LoopDetection.RequireSessionForBlock,
 	}
 
+	// Override tokens
+	var overrideStore *loop.OverrideStore
+	if cfg.LoopDetection.Enabled && cfg.LoopDetection.Action != "shadow" {
+		overrideStore = loop.NewOverrideStore(rdb)
+		log.Info().Msg("override token system enabled")
+	}
+
+	// Budget enforcement
+	var budgetEnforcer *loop.BudgetEnforcer
+	if cfg.Budget.DailyHardUSD > 0 || cfg.Budget.DailySoftUSD > 0 {
+		budgetEnforcer = loop.NewBudgetEnforcer(rdb, cfg.Budget.DailySoftUSD, cfg.Budget.DailyHardUSD, cfg.Budget.ReservePerRequestUSD)
+		log.Info().
+			Float64("daily_soft_usd", cfg.Budget.DailySoftUSD).
+			Float64("daily_hard_usd", cfg.Budget.DailyHardUSD).
+			Msg("budget enforcement enabled")
+	}
+
+	// Alerter
+	var alerter *loop.Alerter
+	if cfg.Alerts.WebhookURL != "" {
+		alerter = loop.NewAlerter(cfg.Alerts.WebhookURL, rdb)
+		log.Info().Str("webhook_url", cfg.Alerts.WebhookURL).Msg("alerter enabled")
+	}
+
 	// Proxy handler
 	proxyHandler := proxy.NewHandler(walWriter, loopStore, loopCfg)
+	proxyHandler.ActionStore = loop.NewPostgresActionStore(pgPool).WithCapabilitySecret(os.Getenv("WITNESS_ACTION_CAPABILITY_SECRET"))
+	if receiptSecret := os.Getenv("WITNESS_RECEIPT_SIGNING_SECRET"); receiptSecret != "" {
+		keyID := os.Getenv("WITNESS_RECEIPT_KEY_ID")
+		proxyHandler.ReceiptSigner = receipts.NewSigner(keyID, []byte(receiptSecret))
+		logKeyID := keyID
+		if logKeyID == "" {
+			logKeyID = "local"
+		}
+		log.Info().Str("key_id", logKeyID).Msg("receipt signing enabled")
+	}
+	proxyHandler.OverrideStore = overrideStore
+	proxyHandler.BudgetEnforcer = budgetEnforcer
+	proxyHandler.Alerter = alerter
+	proxyHandler.DB = pgPool
 
 	// Router
 	r := chi.NewRouter()
@@ -168,6 +226,11 @@ func main() {
 	// chi-level throttle is needed.
 	r.Handle("/openai/*", proxyHandler)
 	r.Handle("/anthropic/*", proxyHandler)
+	r.Handle("/gemini/*", proxyHandler)
+	r.Post("/v1/action/check", proxyHandler.HandleActionCheck)
+	r.Post("/v1/action/result", proxyHandler.HandleActionResult)
+	r.Post("/v1/tool/check", proxyHandler.HandleToolCheck)
+	r.Post("/v1/tool/result", proxyHandler.HandleToolResult)
 
 	// Server
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)

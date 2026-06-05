@@ -14,6 +14,8 @@ type Config struct {
 	Redis         RedisConfig         `yaml:"redis"`
 	WAL           WALConfig           `yaml:"wal"`
 	LoopDetection LoopDetectionConfig `yaml:"loop_detection"`
+	Budget        BudgetConfig        `yaml:"budget"`
+	Alerts        AlertsConfig        `yaml:"alerts"`
 }
 
 // LoopDetectionConfig controls the loop detection engine.
@@ -26,6 +28,18 @@ type LoopDetectionConfig struct {
 	WarnConfidence         float64 `yaml:"warn_confidence"`           // confidence for warn (default 0.40)
 	BlockConfidence        float64 `yaml:"block_confidence"`          // confidence for block (default 0.70)
 	RequireSessionForBlock bool    `yaml:"require_session_for_block"` // safety floor (default true)
+}
+
+// BudgetConfig controls per-project spending caps.
+type BudgetConfig struct {
+	DailySoftUSD         float64 `yaml:"daily_soft_usd"`          // soft cap → warn (default 0 = disabled)
+	DailyHardUSD         float64 `yaml:"daily_hard_usd"`          // hard cap → block (default 0 = disabled)
+	ReservePerRequestUSD float64 `yaml:"reserve_per_request_usd"` // atomic reservation per request (default 0.50)
+}
+
+// AlertsConfig controls webhook notifications.
+type AlertsConfig struct {
+	WebhookURL string `yaml:"webhook_url"` // Slack/webhook URL for loop alerts (empty = disabled)
 }
 
 type ServerConfig struct {
@@ -102,6 +116,14 @@ func Load(path string) (*Config, error) {
 			WarnConfidence:         0.40,
 			BlockConfidence:        0.70,
 			RequireSessionForBlock: true,
+		},
+		Budget: BudgetConfig{
+			DailySoftUSD:         0,    // disabled by default
+			DailyHardUSD:         0,    // disabled by default
+			ReservePerRequestUSD: 0.50, // atomic reservation per request
+		},
+		Alerts: AlertsConfig{
+			WebhookURL: "", // disabled by default
 		},
 	}
 
@@ -203,5 +225,23 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("WITNESS_LOOP_REQUIRE_SESSION_FOR_BLOCK"); v != "" {
 		cfg.LoopDetection.RequireSessionForBlock = v == "true" || v == "1"
+	}
+	if v := os.Getenv("WITNESS_BUDGET_DAILY_SOFT_USD"); v != "" {
+		if val, err := strconv.ParseFloat(v, 64); err == nil {
+			cfg.Budget.DailySoftUSD = val
+		}
+	}
+	if v := os.Getenv("WITNESS_BUDGET_DAILY_HARD_USD"); v != "" {
+		if val, err := strconv.ParseFloat(v, 64); err == nil {
+			cfg.Budget.DailyHardUSD = val
+		}
+	}
+	if v := os.Getenv("WITNESS_BUDGET_RESERVE_PER_REQUEST_USD"); v != "" {
+		if val, err := strconv.ParseFloat(v, 64); err == nil {
+			cfg.Budget.ReservePerRequestUSD = val
+		}
+	}
+	if v := os.Getenv("WITNESS_ALERTS_WEBHOOK_URL"); v != "" {
+		cfg.Alerts.WebhookURL = v
 	}
 }

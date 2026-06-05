@@ -27,12 +27,19 @@ type Provider struct {
 	ExtractStreamUsage func(events []SSEEvent) (Usage, error)
 	// IsStreamRequest checks if the request body indicates streaming.
 	IsStreamRequest func(body []byte) bool
+	// IsStreamPath checks if the URL path indicates streaming (e.g. Gemini uses
+	// :streamGenerateContent in the URL rather than a body field). Optional; nil
+	// means path is never the streaming signal.
+	IsStreamPath func(path string) bool
 	// PrepareStreamBody modifies the request body to ensure usage is included in stream.
 	PrepareStreamBody func(body []byte) ([]byte, error)
 	// ExtractToolCalls parses tool invocations from a non-streaming response.
 	ExtractToolCalls func(body []byte) []ToolCall
 	// ExtractStreamToolCalls parses tool invocations from accumulated SSE events.
 	ExtractStreamToolCalls func(events []SSEEvent) []ToolCall
+	// ExtractLatestToolResult extracts the most recent tool result from a request body.
+	// Tool results live in the request (fed back as messages), not the response.
+	ExtractLatestToolResult func(reqBody []byte) string
 }
 
 // SSEEvent represents a single Server-Sent Event.

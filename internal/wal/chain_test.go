@@ -27,7 +27,9 @@ func TestChain(t *testing.T) {
 	}
 
 	// Chain with genesis
-	Chain(&rec, "genesis")
+	if err := Chain(&rec, "genesis"); err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
 
 	if rec.PrevHash != "genesis" {
 		t.Errorf("expected prev_hash=genesis, got %s", rec.PrevHash)
@@ -46,7 +48,9 @@ func TestChain(t *testing.T) {
 	rec2.InputTokens = 15
 	firstHash := rec.RecordHash
 
-	Chain(&rec2, firstHash)
+	if err := Chain(&rec2, firstHash); err != nil {
+		t.Fatalf("Chain rec2: %v", err)
+	}
 
 	if rec2.PrevHash != firstHash {
 		t.Errorf("expected prev_hash=%s, got %s", firstHash, rec2.PrevHash)
@@ -74,8 +78,12 @@ func TestChainDeterministic(t *testing.T) {
 
 	rec2 := rec1
 
-	Chain(&rec1, "genesis")
-	Chain(&rec2, "genesis")
+	if err := Chain(&rec1, "genesis"); err != nil {
+		t.Fatalf("Chain rec1: %v", err)
+	}
+	if err := Chain(&rec2, "genesis"); err != nil {
+		t.Fatalf("Chain rec2: %v", err)
+	}
 
 	if rec1.RecordHash != rec2.RecordHash {
 		t.Error("identical records should produce identical hashes")
@@ -95,7 +103,9 @@ func TestVerifyChain(t *testing.T) {
 			InputTokens:  i * 10,
 			OutputTokens: i * 20,
 		}
-		Chain(&records[i], prevHash)
+		if err := Chain(&records[i], prevHash); err != nil {
+			t.Fatalf("Chain %d: %v", i, err)
+		}
 		prevHash = records[i].RecordHash
 	}
 
@@ -124,7 +134,9 @@ func TestRecomputeHash(t *testing.T) {
 		Cost:         0.00015,
 	}
 
-	Chain(&rec, "genesis")
+	if err := Chain(&rec, "genesis"); err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
 	originalHash := rec.RecordHash
 
 	// Recompute should match
@@ -251,7 +263,9 @@ func TestLastRecordHashOnDisk_ReturnsLastRecord(t *testing.T) {
 			InputTokens: i,
 			StatusCode:  200,
 		}
-		Chain(&rec, prevHash)
+		if err := Chain(&rec, prevHash); err != nil {
+			t.Fatalf("Chain %d: %v", i, err)
+		}
 		prevHash = rec.RecordHash
 		lastHash = rec.RecordHash
 		line, _ := json.Marshal(rec)
@@ -273,7 +287,9 @@ func TestLastRecordHashOnDisk_PicksLatestFile(t *testing.T) {
 
 	// Day 1 file
 	rec1 := Record{Time: time.Now().UTC(), Project: "test", StatusCode: 200}
-	Chain(&rec1, "genesis")
+	if err := Chain(&rec1, "genesis"); err != nil {
+		t.Fatalf("Chain rec1: %v", err)
+	}
 	f1, _ := os.Create(filepath.Join(dir, "wal-2026-05-25.jsonl"))
 	line1, _ := json.Marshal(rec1)
 	fmt.Fprintf(f1, "%s\n", line1)
@@ -281,7 +297,9 @@ func TestLastRecordHashOnDisk_PicksLatestFile(t *testing.T) {
 
 	// Day 2 file (this should be picked)
 	rec2 := Record{Time: time.Now().UTC(), Project: "test", StatusCode: 200}
-	Chain(&rec2, rec1.RecordHash)
+	if err := Chain(&rec2, rec1.RecordHash); err != nil {
+		t.Fatalf("Chain rec2: %v", err)
+	}
 	f2, _ := os.Create(filepath.Join(dir, "wal-2026-05-26.jsonl"))
 	line2, _ := json.Marshal(rec2)
 	fmt.Fprintf(f2, "%s\n", line2)
@@ -300,7 +318,9 @@ func TestLastRecordHashOnDisk_SkipsMalformedTrailingLines(t *testing.T) {
 	dir := t.TempDir()
 
 	rec := Record{Time: time.Now().UTC(), Project: "test", StatusCode: 200}
-	Chain(&rec, "genesis")
+	if err := Chain(&rec, "genesis"); err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
 	f, _ := os.Create(filepath.Join(dir, "wal-2026-05-25.jsonl"))
 	line, _ := json.Marshal(rec)
 	fmt.Fprintf(f, "%s\n", line)
@@ -454,7 +474,7 @@ func BenchmarkChain(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		Chain(&rec, prevHash)
+		_ = Chain(&rec, prevHash)
 		prevHash = rec.RecordHash
 	}
 }
@@ -470,7 +490,7 @@ func BenchmarkVerifyChain(b *testing.B) {
 			InputTokens:  i,
 			OutputTokens: i * 2,
 		}
-		Chain(&records[i], prevHash)
+		_ = Chain(&records[i], prevHash)
 		prevHash = records[i].RecordHash
 	}
 

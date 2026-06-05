@@ -55,6 +55,16 @@ CREATE TABLE IF NOT EXISTS anomalies (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Action firewall durable idempotency ledger.
+-- This is the source of truth for "has this consequential action already been attempted?"
+CREATE TABLE IF NOT EXISTS action_ledger (
+    action_key      TEXT PRIMARY KEY,
+    first_record    JSONB NOT NULL,
+    first_seen_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at      TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_action_ledger_expires_at ON action_ledger (expires_at);
+
 -- Phase 2: WAL records table (drained from WAL files)
 CREATE TABLE IF NOT EXISTS wal_records (
     id              BIGSERIAL PRIMARY KEY,
@@ -75,9 +85,31 @@ CREATE TABLE IF NOT EXISTS wal_records (
     session_id      TEXT NOT NULL DEFAULT '',
     tool_signature  TEXT NOT NULL DEFAULT '',
     args_fingerprint TEXT NOT NULL DEFAULT '',
+    step_id         TEXT NOT NULL DEFAULT '',
+    result_class    TEXT NOT NULL DEFAULT '',
+    state_delta_hash TEXT NOT NULL DEFAULT '',
+    decision_stage  TEXT NOT NULL DEFAULT '',
     loop_signals_fired TEXT NOT NULL DEFAULT '',
     loop_confidence NUMERIC(5,4) NOT NULL DEFAULT 0,
     loop_action     TEXT NOT NULL DEFAULT '',
+    loop_evidence   TEXT NOT NULL DEFAULT '',
+    decision_id     TEXT NOT NULL DEFAULT '',
+    agent_id        TEXT NOT NULL DEFAULT '',
+    user_id         TEXT NOT NULL DEFAULT '',
+    action_risk     TEXT NOT NULL DEFAULT '',
+    idempotency_key TEXT NOT NULL DEFAULT '',
+    resource_id     TEXT NOT NULL DEFAULT '',
+    amount_cents    BIGINT NOT NULL DEFAULT 0,
+    max_amount_cents BIGINT NOT NULL DEFAULT 0,
+    backup_id       TEXT NOT NULL DEFAULT '',
+    recipient_domain TEXT NOT NULL DEFAULT '',
+    allowed_domain  TEXT NOT NULL DEFAULT '',
+    capability_hash TEXT NOT NULL DEFAULT '',
+    policy_version  TEXT NOT NULL DEFAULT '',
+    decision_reason TEXT NOT NULL DEFAULT '',
+    decision_evidence TEXT NOT NULL DEFAULT '',
+    receipt_signature TEXT NOT NULL DEFAULT '',
+    receipt_key_id  TEXT NOT NULL DEFAULT '',
     prev_hash       TEXT NOT NULL,
     record_hash     TEXT NOT NULL UNIQUE,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -86,6 +118,37 @@ CREATE TABLE IF NOT EXISTS wal_records (
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_prompts_project_hash ON prompts (project_id, prompt_hash);
 CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys (key_hash);
+
+-- Migration: add Phase 1-3 columns if they don't exist (for tables created before these were added)
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS ulid                TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS session_id          TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS tool_signature      TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS args_fingerprint    TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS step_id             TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS result_class        TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS state_delta_hash    TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS decision_stage      TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS loop_signals_fired  TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS loop_confidence     NUMERIC(5,4) NOT NULL DEFAULT 0;
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS loop_action         TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS loop_evidence       TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS decision_id         TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS agent_id            TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS user_id             TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS action_risk         TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS idempotency_key     TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS resource_id         TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS amount_cents        BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS max_amount_cents    BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS backup_id           TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS recipient_domain    TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS allowed_domain      TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS capability_hash     TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS policy_version      TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS decision_reason     TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS decision_evidence   TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS receipt_signature   TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS receipt_key_id       TEXT NOT NULL DEFAULT '';
 
 -- Phase 2: WAL records indexes for reconciliation queries
 CREATE INDEX IF NOT EXISTS idx_wal_records_time ON wal_records (time);
@@ -106,6 +169,10 @@ ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS immediate_outcome  TEXT NOT NUL
 
 CREATE INDEX IF NOT EXISTS idx_wal_records_trajectory ON wal_records (trajectory_id);
 CREATE INDEX IF NOT EXISTS idx_wal_records_near_miss  ON wal_records (near_miss) WHERE near_miss = TRUE;
+CREATE INDEX IF NOT EXISTS idx_wal_records_decision_id ON wal_records (decision_id) WHERE decision_id <> '';
+CREATE INDEX IF NOT EXISTS idx_wal_records_idempotency ON wal_records (project, idempotency_key, time) WHERE idempotency_key <> '';
+CREATE INDEX IF NOT EXISTS idx_wal_records_resource ON wal_records (project, resource_id, time) WHERE resource_id <> '';
+CREATE INDEX IF NOT EXISTS idx_wal_records_capability ON wal_records (capability_hash) WHERE capability_hash <> '';
 
 -- v5.2: trajectory labels — the most valuable table in the whole system.
 -- Every override token redemption writes a row automatically (source='override_token').

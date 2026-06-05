@@ -23,25 +23,21 @@ type chainHead struct {
 
 // Chain computes the record hash and sets prev_hash from the last committed record.
 // Called in writer.go before appending each line.
-func Chain(record *Record, prevHash string) {
-	// Set the previous hash
+func Chain(record *Record, prevHash string) error {
 	record.PrevHash = prevHash
 
-	// Marshal the record WITHOUT the record_hash field to compute the hash
-	// We'll compute it by temporarily setting it to empty
-	oldRecordHash := record.RecordHash
+	oldHash := record.RecordHash
 	record.RecordHash = ""
 
 	b, err := json.Marshal(record)
 	if err != nil {
-		// Should never happen for valid Record structs
-		record.RecordHash = oldRecordHash
-		return
+		record.RecordHash = oldHash
+		return fmt.Errorf("failed to hash record: %w", err)
 	}
 
-	// Compute SHA256 hash
 	h := sha256.Sum256(b)
 	record.RecordHash = hex.EncodeToString(h[:])
+	return nil
 }
 
 // loadChainHead loads the last record hash from wal-chain-head.json.
@@ -121,6 +117,9 @@ func RecomputeHash(record Record) string {
 // record_hash of its last valid JSONL line. Returns "" if no WAL files exist
 // or the file is empty. Used at startup to detect crash gaps where the saved
 // chain head is stale relative to what actually made it to disk.
+//
+// Uses iterative 64KB chunk scanning (up to 16MB) so it handles WAL files
+// where the tail is corrupted or contains many malformed trailing lines.
 func LastRecordHashOnDisk(dir string) (string, error) {
 	files, err := filepath.Glob(filepath.Join(dir, "wal-*.jsonl"))
 	if err != nil {
@@ -139,7 +138,6 @@ func LastRecordHashOnDisk(dir string) (string, error) {
 	}
 	defer f.Close()
 
-	// Read last 64KB — more than enough for the last few records.
 	stat, err := f.Stat()
 	if err != nil {
 		return "", fmt.Errorf("stat %s: %w", filepath.Base(lastFile), err)
@@ -148,32 +146,38 @@ func LastRecordHashOnDisk(dir string) (string, error) {
 		return "", nil
 	}
 
-	readSize := int64(64 * 1024)
-	offset := stat.Size() - readSize
-	if offset < 0 {
-		offset = 0
-		readSize = stat.Size()
-	}
+	const maxScan = 16 << 20 // 16MB ceiling
+	chunkSize := int64(64 * 1024)
+	offset := stat.Size()
+	var tailData []byte
 
-	buf := make([]byte, readSize)
-	n, err := f.ReadAt(buf, offset)
-	if err != nil && err != io.EOF {
-		return "", fmt.Errorf("read tail of %s: %w", filepath.Base(lastFile), err)
-	}
-	buf = buf[:n]
+	for offset > 0 && int64(len(tailData)) < maxScan {
+		readSize := chunkSize
+		if offset < readSize {
+			readSize = offset
+		}
+		offset -= readSize
 
-	// Find the last valid JSONL line by scanning backwards.
-	lines := strings.Split(strings.TrimSpace(string(buf)), "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := strings.TrimSpace(lines[i])
-		if line == "" {
-			continue
+		buf := make([]byte, readSize)
+		if _, err := f.ReadAt(buf, offset); err != nil && err != io.EOF {
+			return "", fmt.Errorf("read tail of %s: %w", filepath.Base(lastFile), err)
 		}
-		var rec Record
-		if err := json.Unmarshal([]byte(line), &rec); err != nil {
-			continue // skip malformed (might be a truncated first line from offset read)
+
+		tailData = append(buf, tailData...)
+
+		// Scan accumulated data backwards for the last valid JSONL line.
+		lines := strings.Split(strings.TrimSpace(string(tailData)), "\n")
+		for i := len(lines) - 1; i >= 0; i-- {
+			line := strings.TrimSpace(lines[i])
+			if line == "" {
+				continue
+			}
+			var rec Record
+			if err := json.Unmarshal([]byte(line), &rec); err != nil {
+				continue // skip malformed (truncated first line from offset read)
+			}
+			return rec.RecordHash, nil
 		}
-		return rec.RecordHash, nil
 	}
 
 	return "", nil
