@@ -1,0 +1,13 @@
+{
+  "name": "@witness/agent",
+  "version": "0.0.0",
+  "description": "Fail-open Witness action firewall SDK for JavaScript agents",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=18"
+  }
+}

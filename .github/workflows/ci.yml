@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Go tests
+        run: go test ./...
+
+      - name: JavaScript SDK syntax
+        run: node --check sdk/javascript/witness-agent/index.js
+
+      - name: Python SDK syntax
+        run: python -m py_compile sdk/python/witness_agent/langchain.py sdk/python/witness_agent/__init__.py
