@@ -1,20 +1,29 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/witness-proxy/witness-proxy/internal/config"
 	"github.com/witness-proxy/witness-proxy/internal/doctor"
+	"github.com/witness-proxy/witness-proxy/internal/evidencepack"
 	"github.com/witness-proxy/witness-proxy/internal/loop"
 	"github.com/witness-proxy/witness-proxy/internal/loopeval"
-	"github.com/witness-proxy/witness-proxy/internal/providerdoctor"
+	"github.com/witness-proxy/witness-proxy/internal/outcomeexport"
 	"github.com/witness-proxy/witness-proxy/internal/receiptverify"
 	"github.com/witness-proxy/witness-proxy/internal/shadowreport"
+	"github.com/witness-proxy/witness-proxy/internal/storage"
 )
 
 func main() {
@@ -24,20 +33,251 @@ func main() {
 	}
 
 	switch os.Args[1] {
+	case "demo":
+		runDemo(os.Args[2:])
 	case "doctor":
 		runDoctor(os.Args[2:])
-	case "provider-doctor":
-		runProviderDoctor(os.Args[2:])
 	case "eval":
 		runEval(os.Args[2:])
 	case "shadow-report":
 		runShadowReport(os.Args[2:])
+	case "evidence-pack":
+		runEvidencePack(os.Args[2:])
 	case "verify-receipts":
 		runVerifyReceipts(os.Args[2:])
+	case "review-decision":
+		runReviewDecision(os.Args[2:])
+	case "export-outcomes":
+		runExportOutcomes(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
 	}
+}
+
+type reviewDecisionConfig struct {
+	BaseURL    string
+	Project    string
+	APIKey     string
+	DecisionID string
+	Label      string
+	Role       string
+	Notes      string
+	Timeout    time.Duration
+}
+
+type reviewDecisionResult struct {
+	DecisionID             string    `json:"decision_id"`
+	Label                  string    `json:"label"`
+	ReviewerSource         string    `json:"reviewer_source"`
+	ReviewerRole           string    `json:"reviewer_role"`
+	NotesFingerprint       string    `json:"notes_fingerprint,omitempty"`
+	NotesStoredRaw         bool      `json:"notes_stored_raw"`
+	RepeatedReviewBehavior string    `json:"repeated_review_behavior"`
+	ReviewedAt             time.Time `json:"reviewed_at"`
+}
+
+func runReviewDecision(args []string) {
+	fs := flag.NewFlagSet("review-decision", flag.ExitOnError)
+	baseURL := fs.String("base-url", envOrDefault([]string{"WITNESS_BASE_URL", "WITNESS_URL"}, "http://localhost:8080"), "Witness base URL")
+	project := fs.String("project", envOrDefault([]string{"WITNESS_PROJECT", "WITNESS_PROJECT_KEY"}, ""), "Witness project")
+	apiKey := fs.String("api-key", envOrDefault([]string{"WITNESS_API_KEY", "WITNESS_PROJECT_KEY"}, ""), "Witness API key")
+	decisionID := fs.String("decision", "", "decision id to review")
+	label := fs.String("label", "", "review label")
+	role := fs.String("role", "unknown", "reviewer role: developer, sre, security, founder, unknown")
+	notes := fs.String("notes", "", "optional notes; stored as a fingerprint by default")
+	timeout := fs.Duration("timeout", 3*time.Second, "request timeout")
+	jsonOut := fs.Bool("json", false, "print JSON")
+	_ = fs.Parse(args)
+
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+	result, err := submitDecisionReview(ctx, reviewDecisionConfig{
+		BaseURL:    *baseURL,
+		Project:    *project,
+		APIKey:     *apiKey,
+		DecisionID: *decisionID,
+		Label:      *label,
+		Role:       *role,
+		Notes:      *notes,
+		Timeout:    *timeout,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "review-decision failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	if *jsonOut {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(result)
+		return
+	}
+	fmt.Printf("Witness decision review\n")
+	fmt.Printf("decision_id=%s label=%s role=%s source=%s\n", result.DecisionID, result.Label, result.ReviewerRole, result.ReviewerSource)
+	if result.NotesFingerprint != "" {
+		fmt.Printf("notes_fingerprint=%s\n", result.NotesFingerprint)
+	}
+	fmt.Printf("repeated_review_behavior=%s\n", result.RepeatedReviewBehavior)
+}
+
+func submitDecisionReview(ctx context.Context, cfg reviewDecisionConfig) (reviewDecisionResult, error) {
+	var result reviewDecisionResult
+	if strings.TrimSpace(cfg.DecisionID) == "" {
+		return result, fmt.Errorf("-decision is required")
+	}
+	if strings.TrimSpace(cfg.Label) == "" {
+		return result, fmt.Errorf("-label is required")
+	}
+	base := strings.TrimRight(cfg.BaseURL, "/")
+	if base == "" {
+		return result, fmt.Errorf("-base-url is required")
+	}
+	body, err := json.Marshal(map[string]string{
+		"label":         strings.TrimSpace(cfg.Label),
+		"reviewer_role": strings.TrimSpace(cfg.Role),
+		"notes":         cfg.Notes,
+	})
+	if err != nil {
+		return result, fmt.Errorf("encode review: %w", err)
+	}
+	endpoint := base + "/v1/decisions/" + url.PathEscape(strings.TrimSpace(cfg.DecisionID)) + "/review"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return result, fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if cfg.Project != "" {
+		req.Header.Set("X-Project", cfg.Project)
+	}
+	if cfg.APIKey != "" {
+		req.Header.Set("X-Witness-API-Key", cfg.APIKey)
+	}
+	client := &http.Client{Timeout: cfg.Timeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return result, fmt.Errorf("post review: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return result, fmt.Errorf("Witness returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return result, fmt.Errorf("parse review response: %w", err)
+	}
+	return result, nil
+}
+
+func runExportOutcomes(args []string) {
+	fs := flag.NewFlagSet("export-outcomes", flag.ExitOnError)
+	project := fs.String("project", envOrDefault([]string{"WITNESS_PROJECT"}, ""), "project to export")
+	sinceRaw := fs.String("since", "", "inclusive UTC day, e.g. 2026-01-01")
+	outPath := fs.String("out", "", "output JSONL path")
+	anonymize := fs.Bool("anonymize", true, "required; non-anonymized export is not supported")
+	saltEnv := fs.String("salt-env", "WITNESS_ANON_SALT", "environment variable containing anonymization salt")
+	includeCostExact := fs.Bool("include-cost-exact", false, "include exact estimated_cost_usd; default exports buckets only")
+	reviewedOnly := fs.Bool("reviewed-only", false, "exclude decisions without a customer review label")
+	configPath := fs.String("config", "configs/proxy.yaml", "Witness config path")
+	timeout := fs.Duration("timeout", 15*time.Second, "export timeout")
+	_ = fs.Parse(args)
+
+	if strings.TrimSpace(*project) == "" {
+		fmt.Fprintln(os.Stderr, "-project is required")
+		os.Exit(2)
+	}
+	since, err := parseExportSince(*sinceRaw)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid -since: %v\n", err)
+		os.Exit(2)
+	}
+	if strings.TrimSpace(*outPath) == "" {
+		fmt.Fprintln(os.Stderr, "-out is required")
+		os.Exit(2)
+	}
+	if !*anonymize {
+		fmt.Fprintln(os.Stderr, "non-anonymized outcome export is not supported")
+		os.Exit(2)
+	}
+	salt := os.Getenv(strings.TrimSpace(*saltEnv))
+	if strings.TrimSpace(salt) == "" {
+		fmt.Fprintf(os.Stderr, "-salt-env %s is empty; set it to a customer-approved export salt\n", *saltEnv)
+		os.Exit(2)
+	}
+
+	cfgPath := strings.TrimSpace(*configPath)
+	if cfgPath != "" {
+		if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
+			cfgPath = ""
+		}
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+
+	pool, err := pgxpool.New(ctx, cfg.Postgres.DSN())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "connect postgres: %v\n", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	rows, err := storage.NewMoatStore(pool).ListActionDecisionOutcomesForExport(ctx, *project, since, *reviewedOnly)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load outcomes: %v\n", err)
+		os.Exit(1)
+	}
+
+	out, closeOut, err := createExportOutput(*outPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "create export output: %v\n", err)
+		os.Exit(1)
+	}
+	count, writeErr := outcomeexport.WriteJSONL(out, rows, outcomeexport.Options{
+		Anonymize:        *anonymize,
+		Salt:             salt,
+		IncludeCostExact: *includeCostExact,
+		ReviewedOnly:     *reviewedOnly,
+	})
+	closeErr := closeOut()
+	if writeErr != nil {
+		fmt.Fprintf(os.Stderr, "write export: %v\n", writeErr)
+		os.Exit(1)
+	}
+	if closeErr != nil {
+		fmt.Fprintf(os.Stderr, "close export output: %v\n", closeErr)
+		os.Exit(1)
+	}
+	fmt.Printf("exported_outcomes=%d out=%s anonymized=true reviewed_only=%t include_cost_exact=%t\n",
+		count, *outPath, *reviewedOnly, *includeCostExact)
+}
+
+func parseExportSince(raw string) (time.Time, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}, fmt.Errorf("date is required")
+	}
+	t, err := time.Parse("2006-01-02", raw)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("use YYYY-MM-DD: %w", err)
+	}
+	return t.UTC(), nil
+}
+
+func createExportOutput(path string) (io.Writer, func() error, error) {
+	if path == "-" {
+		return os.Stdout, func() error { return nil }, nil
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	if err != nil {
+		return nil, nil, err
+	}
+	return f, f.Close, nil
 }
 
 func runDoctor(args []string) {
@@ -84,64 +324,14 @@ func runDoctor(args []string) {
 	}
 }
 
-func runProviderDoctor(args []string) {
-	loadDotEnv(".env")
-
-	fs := flag.NewFlagSet("provider-doctor", flag.ExitOnError)
-	provider := fs.String("provider", "gemini", "provider to test")
-	model := fs.String("model", envOrDefault([]string{"WITNESS_LIVE_GEMINI_MODEL", "GEMINI_MODEL"}, "gemini-2.5-flash-lite"), "provider model to test")
-	apiKey := fs.String("api-key", envOrDefault([]string{"GOOGLE_API_KEY", "GEMINI_API_KEY"}, ""), "provider API key")
-	baseURL := fs.String("base-url", envOrDefault([]string{"GEMINI_BASE_URL"}, "https://generativelanguage.googleapis.com"), "provider base URL")
-	timeout := fs.Duration("timeout", 10*time.Second, "per-check timeout")
-	jsonOut := fs.Bool("json", false, "print JSON")
-	_ = fs.Parse(args)
-
-	if *provider != "gemini" {
-		fmt.Fprintf(os.Stderr, "unsupported provider %q; currently supported: gemini\n", *provider)
-		os.Exit(2)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*(*timeout))
-	defer cancel()
-
-	report := providerdoctor.RunGemini(ctx, providerdoctor.Config{
-		APIKey:  *apiKey,
-		Model:   *model,
-		BaseURL: *baseURL,
-		Timeout: *timeout,
-	})
-
-	if *jsonOut {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		_ = enc.Encode(report)
-	} else {
-		fmt.Printf("Witness provider doctor\n")
-		fmt.Printf("provider: %s\n", report.Provider)
-		fmt.Printf("model: %s\n", report.Model)
-		fmt.Printf("base_url: %s\n", report.BaseURL)
-		for _, check := range report.Checks {
-			status := "ok"
-			if !check.OK {
-				status = "fail"
-			}
-			if check.Detail != "" {
-				fmt.Printf("[%s] %s: %s\n", status, check.Name, check.Detail)
-			} else {
-				fmt.Printf("[%s] %s\n", status, check.Name)
-			}
-		}
-	}
-
-	if !report.OK() {
-		os.Exit(1)
-	}
-}
-
 func runShadowReport(args []string) {
 	fs := flag.NewFlagSet("shadow-report", flag.ExitOnError)
+	format := fs.String("format", "text", "output format: text, markdown, json")
 	jsonOut := fs.Bool("json", false, "print JSON")
 	_ = fs.Parse(args)
+	if *jsonOut {
+		*format = "json"
+	}
 
 	records, err := readShadowRecords(fs.Args())
 	if err != nil {
@@ -150,29 +340,130 @@ func runShadowReport(args []string) {
 	}
 	report := shadowreport.Build(records)
 
-	if *jsonOut {
+	switch strings.ToLower(strings.TrimSpace(*format)) {
+	case "json":
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(report)
 		return
+	case "markdown", "md":
+		fmt.Print(shadowreport.Markdown(report))
+		return
+	case "text", "":
+	default:
+		fmt.Fprintf(os.Stderr, "unknown shadow-report format %q; use text, markdown, or json\n", *format)
+		os.Exit(2)
 	}
 
 	fmt.Printf("Witness shadow report\n")
-	fmt.Printf("records=%d tool_events=%d action_receipts=%d\n", report.TotalRecords, report.ToolEvents, report.ActionReceipts)
-	fmt.Printf("would_block=%d blocked=%d duplicate_side_effects=%d no_progress_events=%d\n",
-		report.WouldBlock, report.Blocked, report.DuplicateSideEffects, report.NoProgressEvents)
-	fmt.Printf("estimated_wasted_cost_usd=%.6f\n", report.EstimatedWastedCostUSD)
+	fmt.Printf("records=%d tool_events=%d total_action_decisions=%d\n", report.TotalRecords, report.ToolEvents, report.TotalActionDecisions)
+	fmt.Printf("would_block_decisions=%d blocked=%d duplicate_side_effect_decisions=%d no_progress_decisions=%d budget_decisions=%d\n",
+		report.WouldBlockDecisions, report.Blocked, report.DuplicateSideEffectDecisions, report.NoProgressDecisions, report.BudgetDecisions)
+	fmt.Printf("estimated_cost_saved_usd=%.6f\n", report.EstimatedCostSavedUSD)
+	fmt.Printf("unreviewed_decisions_count=%d recommended_review_sample=%d\n",
+		report.UnreviewedDecisionsCount, len(report.RecommendedReviewSample))
 	if report.RecommendedFirstPolicy != "" {
 		fmt.Printf("recommended_first_policy=%s\n", report.RecommendedFirstPolicy)
 	}
-	printCounts("top_tools", report.TopTools)
+	printCounts("top_tools_by_risky_decisions", report.TopToolsByRiskyDecisions)
 	printCounts("top_result_classes", report.TopResultClasses)
-	if len(report.FalsePositiveReviewSet) > 0 {
-		fmt.Printf("false_positive_review_set=%d\n", len(report.FalsePositiveReviewSet))
-		for _, item := range report.FalsePositiveReviewSet {
-			fmt.Printf("- decision_id=%s project=%s session=%s tool=%s action=%s result=%s reason=%s\n",
-				item.DecisionID, item.Project, item.SessionID, item.ToolName, item.LoopAction, item.ResultClass, item.Reason)
+	if len(report.RecommendedReviewSample) > 0 {
+		fmt.Printf("review_queue\n")
+		for _, item := range report.RecommendedReviewSample {
+			fmt.Printf("- decision_id=%s action_name=%s witness_action=%s risk_class=%s result_class=%s estimated_cost_usd=%.6f estimated_risk=%s\n",
+				item.DecisionID, item.ActionName, item.WitnessAction, item.RiskClass, item.ResultClass, item.EstimatedCostUSD, item.EstimatedRisk)
+			if item.Reason != "" {
+				fmt.Printf("  reason=%s\n", item.Reason)
+			}
+			if item.EvidenceSummary != "" {
+				fmt.Printf("  evidence_summary=%s\n", item.EvidenceSummary)
+			}
+			if item.ReviewCommand != "" {
+				fmt.Printf("  label_command=%s\n", item.ReviewCommand)
+			}
 		}
+	}
+}
+
+func runEvidencePack(args []string) {
+	fs := flag.NewFlagSet("evidence-pack", flag.ExitOnError)
+	format := fs.String("format", "markdown", "output format: markdown or json")
+	sinceRaw := fs.String("since", "", "inclusive start day, YYYY-MM-DD")
+	untilRaw := fs.String("until", "", "exclusive end day, YYYY-MM-DD")
+	project := fs.String("project", "", "limit to a single project")
+	receiptPublicKey := fs.String("receipt-public-key", os.Getenv("WITNESS_RECEIPT_PUBLIC_KEY"), "base64 Ed25519 receipt public key; verifies signatures without the signing secret")
+	receiptSecret := fs.String("receipt-secret", os.Getenv("WITNESS_RECEIPT_SIGNING_SECRET"), "receipt signing secret (operator path)")
+	out := fs.String("out", "", "write the pack to this file instead of stdout")
+	_ = fs.Parse(args)
+
+	opts := evidencepack.Options{
+		Project:          *project,
+		ReceiptPublicKey: *receiptPublicKey,
+		ReceiptSecret:    *receiptSecret,
+	}
+	if *sinceRaw != "" {
+		since, err := parseExportSince(*sinceRaw)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "since: %v\n", err)
+			os.Exit(2)
+		}
+		opts.Since = since
+	}
+	if *untilRaw != "" {
+		until, err := parseExportSince(*untilRaw)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "until: %v\n", err)
+			os.Exit(2)
+		}
+		// --until is given as a day; make it inclusive of that whole day.
+		opts.Until = until.AddDate(0, 0, 1)
+	}
+
+	records, err := readShadowRecords(fs.Args())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	pack := evidencepack.Build(records, opts)
+
+	var rendered []byte
+	switch strings.ToLower(strings.TrimSpace(*format)) {
+	case "json":
+		rendered, err = evidencepack.RenderJSON(pack)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "render json: %v\n", err)
+			os.Exit(1)
+		}
+	case "markdown", "md", "":
+		rendered = []byte(evidencepack.RenderMarkdown(pack))
+	default:
+		fmt.Fprintf(os.Stderr, "unknown evidence-pack format %q; use markdown or json\n", *format)
+		os.Exit(2)
+	}
+
+	if *out == "" {
+		fmt.Print(string(rendered))
+	} else {
+		w, closeFn, createErr := createExportOutput(*out)
+		if createErr != nil {
+			fmt.Fprintf(os.Stderr, "open %s: %v\n", *out, createErr)
+			os.Exit(1)
+		}
+		if _, writeErr := w.Write(rendered); writeErr != nil {
+			_ = closeFn()
+			fmt.Fprintf(os.Stderr, "write %s: %v\n", *out, writeErr)
+			os.Exit(1)
+		}
+		if closeErr := closeFn(); closeErr != nil {
+			fmt.Fprintf(os.Stderr, "close %s: %v\n", *out, closeErr)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "wrote evidence pack to %s\n", *out)
+	}
+
+	// Make integrity failures actionable: a non-verifying pack should not exit clean.
+	if !pack.Integrity.Verified {
+		os.Exit(1)
 	}
 }
 
@@ -180,10 +471,11 @@ func runVerifyReceipts(args []string) {
 	fs := flag.NewFlagSet("verify-receipts", flag.ExitOnError)
 	jsonOut := fs.Bool("json", false, "print JSON")
 	receiptSecret := fs.String("receipt-secret", os.Getenv("WITNESS_RECEIPT_SIGNING_SECRET"), "receipt signing secret; defaults to WITNESS_RECEIPT_SIGNING_SECRET")
+	receiptPublicKey := fs.String("receipt-public-key", os.Getenv("WITNESS_RECEIPT_PUBLIC_KEY"), "base64 Ed25519 receipt public key; verify receipts without the signing secret")
 	requireSignatures := fs.Bool("require-signatures", false, "fail verification if any action receipt is unsigned")
 	_ = fs.Parse(args)
-	if *requireSignatures && *receiptSecret == "" {
-		fmt.Fprintln(os.Stderr, "-require-signatures needs -receipt-secret or WITNESS_RECEIPT_SIGNING_SECRET")
+	if *requireSignatures && *receiptSecret == "" && *receiptPublicKey == "" {
+		fmt.Fprintln(os.Stderr, "-require-signatures needs -receipt-public-key (or -receipt-secret / WITNESS_RECEIPT_SIGNING_SECRET)")
 		os.Exit(1)
 	}
 
@@ -194,6 +486,7 @@ func runVerifyReceipts(args []string) {
 	}
 	report := receiptverify.VerifyWithOptions(records, receiptverify.Options{
 		ReceiptSecret:     *receiptSecret,
+		ReceiptPublicKey:  *receiptPublicKey,
 		RequireSignatures: *requireSignatures,
 	})
 
@@ -367,25 +660,6 @@ func envOrDefault(names []string, fallback string) string {
 	return fallback
 }
 
-func loadDotEnv(path string) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return
-	}
-	for _, raw := range strings.Split(string(data), "\n") {
-		line := strings.TrimSpace(raw)
-		if line == "" || strings.HasPrefix(line, "#") || !strings.Contains(line, "=") {
-			continue
-		}
-		parts := strings.SplitN(line, "=", 2)
-		name := strings.TrimSpace(parts[0])
-		value := strings.Trim(strings.TrimSpace(parts[1]), `"`)
-		if name != "" && value != "" && os.Getenv(name) == "" {
-			_ = os.Setenv(name, value)
-		}
-	}
-}
-
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: witness doctor|provider-doctor|eval|shadow-report|verify-receipts [flags]")
+	fmt.Fprintln(os.Stderr, "usage: witness demo|doctor|eval|shadow-report|evidence-pack|verify-receipts|review-decision|export-outcomes [flags]")
 }
