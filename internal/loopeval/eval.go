@@ -151,6 +151,9 @@ func Evaluate(events []Event, cfg loop.Config, gates GateConfig) Report {
 func evaluateTrace(key traceKey, events []Event, cfg loop.Config) (TraceResult, []float64) {
 	state := loop.NewState()
 	var decision loop.Decision
+	// maxDecision carries the highest-severity decision seen across the stream;
+	// a trace is judged by its worst moment, not its final turn.
+	var maxDecision loop.Decision
 	var durations []float64
 	var firstBlock int
 	var totalCost float64
@@ -183,12 +186,15 @@ func evaluateTrace(key traceKey, events []Event, cfg loop.Config) (TraceResult, 
 		state, decision = loop.Observe(state, obs, cfg)
 		durations = append(durations, float64(time.Since(start).Microseconds())/1000)
 		totalCost += event.CostUSD
+		if decisionRank(decision.ActionCeiling) > decisionRank(maxDecision.ActionCeiling) {
+			maxDecision = decision
+		}
 		if firstBlock == 0 && decision.ActionCeiling == loop.ActionBlock {
 			firstBlock = i + 1
 		}
 	}
 
-	final := actionName(decision.ActionCeiling)
+	final := actionName(maxDecision.ActionCeiling)
 	if expected == "" {
 		expected = expectedFromLabel(label)
 	}
@@ -198,8 +204,8 @@ func evaluateTrace(key traceKey, events []Event, cfg loop.Config) (TraceResult, 
 		Label:        label,
 		Expected:     expected,
 		FinalAction:  final,
-		Confidence:   decision.Confidence,
-		Signals:      decision.SignalsFired,
+		Confidence:   maxDecision.Confidence,
+		Signals:      maxDecision.SignalsFired,
 		Events:       len(events),
 		FirstBlock:   firstBlock,
 		TotalCostUSD: round4(totalCost),
@@ -263,6 +269,17 @@ func Anonymize(events []Event, salt string) []Event {
 		out[i] = event
 	}
 	return out
+}
+
+func decisionRank(action loop.Action) int {
+	switch action {
+	case loop.ActionBlock:
+		return 3
+	case loop.ActionWarn:
+		return 2
+	default:
+		return 1
+	}
 }
 
 func actionName(action loop.Action) string {

@@ -163,6 +163,36 @@ func legitEvents() []Event {
 	return events
 }
 
+// A block mid-stream must stick as the trace verdict even if the tail of the
+// stream cools back down to allow — max action across the stream, not final turn.
+func TestEvaluateScoresMaxActionAcrossStream(t *testing.T) {
+	var events []Event
+	for i := 0; i < 8; i++ {
+		events = append(events, Event{
+			Project: "p", SessionID: "max-action", ToolName: "update_record",
+			Args: map[string]any{"id": 42}, Result: map[string]any{"error": "server_error"},
+			ResultClass: "unknown_error", CostUSD: 0.01, UnixMillis: int64(i+1) * 1000,
+			Label: "true_runaway", ExpectedAction: "block",
+		})
+	}
+	tools := []string{"search_docs", "read_file", "get_ticket"}
+	for i := 0; i < 18; i++ {
+		events = append(events, Event{
+			Project: "p", SessionID: "max-action", ToolName: tools[i%3],
+			Args: map[string]any{"q": i, "step": i * 7}, Result: map[string]any{"ok": true, "hit": i, "data": i * 13},
+			ResultClass: "success", CostUSD: 0.001, UnixMillis: int64(60_000 + i*60_000),
+			Label: "true_runaway", ExpectedAction: "block",
+		})
+	}
+	report := Evaluate(events, loop.DefaultConfig(), DefaultGateConfig())
+	if report.MissedRunaways != 0 {
+		t.Fatalf("missed runaways=%d want 0 — block mid-stream must count (final-turn bug)", report.MissedRunaways)
+	}
+	if report.TruePositiveBlocks != 1 {
+		t.Fatalf("true positive blocks=%d want 1", report.TruePositiveBlocks)
+	}
+}
+
 func mustJSON(value any) string {
 	data, err := json.Marshal(value)
 	if err != nil {
