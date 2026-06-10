@@ -1,6 +1,12 @@
-# Binaries
+# Build artifacts
 /proxy
 /waldrain
+/witness
+/loopreplay
+/bin/
+/dist/
+/tmp/
+/build/
 *.exe
 *.dll
 *.so
@@ -9,7 +15,11 @@
 # Test
 *.test
 *.out
+/out/
 coverage.txt
+coverage.out
+coverage.xml
+.coverage
 test-report.txt
 test-results.csv
 test-summary.txt
@@ -35,8 +45,13 @@ Thumbs.db
 wal-*.jsonl
 wal-offset.json
 
+# Offline eval generated data
+/testdata/evals/exgentic/cache/
+/testdata/evals/exgentic/out/
+
 # Local env
-.env
+.env*
+!.env.example
 
 # Planning docs (not part of shipped product)
 implementation.txt
