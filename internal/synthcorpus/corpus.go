@@ -1,5 +1,5 @@
 // Package synthcorpus replays synthetic-corpus JSONL sessions through the REAL
-// Witness pipeline (loop detector + action firewall) and scores the results.
+// HubbleOps pipeline (loop detector + action firewall) and scores the results.
 // It never reimplements detection logic; it drives loop.Decide / loop.Observe /
 // ActionStore.Decide exactly as internal/proxy/tool_events.go does.
 package synthcorpus

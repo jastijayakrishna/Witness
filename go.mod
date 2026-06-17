@@ -1,4 +1,4 @@
-module github.com/witness-proxy/witness-proxy
+module github.com/hubbleops/hubbleops
 
 go 1.25.0
 

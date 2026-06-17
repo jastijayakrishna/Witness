@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/witness-proxy/witness-proxy/internal/loop"
-	"github.com/witness-proxy/witness-proxy/internal/providers"
+	"github.com/hubbleops/hubbleops/internal/loop"
+	"github.com/hubbleops/hubbleops/internal/providers"
 )
 
 func TestClassifyProviderResponse(t *testing.T) {

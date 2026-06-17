@@ -4,15 +4,15 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: witness
-      POSTGRES_PASSWORD: witness
-      POSTGRES_DB: witness
+      POSTGRES_USER: hubbleops
+      POSTGRES_PASSWORD: hubbleops
+      POSTGRES_DB: hubbleops
     ports:
       - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U witness"]
+      test: ["CMD-SHELL", "pg_isready -U hubbleops"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -34,17 +34,20 @@ services:
     ports:
       - "8080:8080"
     environment:
-      WITNESS_SERVER_HOST: "0.0.0.0"
-      WITNESS_SERVER_PORT: "8080"
-      WITNESS_POSTGRES_HOST: "postgres"
-      WITNESS_POSTGRES_PORT: "5432"
-      WITNESS_POSTGRES_USER: "witness"
-      WITNESS_POSTGRES_PASSWORD: "witness"
-      WITNESS_POSTGRES_DBNAME: "witness"
-      WITNESS_POSTGRES_SSLMODE: "disable"
-      WITNESS_REDIS_HOST: "redis"
-      WITNESS_REDIS_PORT: "6379"
-      WITNESS_WAL_DIR: "/data/wal"
+      HUBBLEOPS_ENV: "dev"
+      HUBBLEOPS_DEV_AUTH_BYPASS: "true"
+      HUBBLEOPS_METRICS_PUBLIC: "true"
+      HUBBLEOPS_SERVER_HOST: "0.0.0.0"
+      HUBBLEOPS_SERVER_PORT: "8080"
+      HUBBLEOPS_POSTGRES_HOST: "postgres"
+      HUBBLEOPS_POSTGRES_PORT: "5432"
+      HUBBLEOPS_POSTGRES_USER: "hubbleops"
+      HUBBLEOPS_POSTGRES_PASSWORD: "hubbleops"
+      HUBBLEOPS_POSTGRES_DBNAME: "hubbleops"
+      HUBBLEOPS_POSTGRES_SSLMODE: "disable"
+      HUBBLEOPS_REDIS_HOST: "redis"
+      HUBBLEOPS_REDIS_PORT: "6379"
+      HUBBLEOPS_WAL_DIR: "/data/wal"
     depends_on:
       postgres:
         condition: service_healthy
@@ -61,13 +64,13 @@ services:
     ports:
       - "9090:9090"
     environment:
-      WITNESS_POSTGRES_HOST: "postgres"
-      WITNESS_POSTGRES_PORT: "5432"
-      WITNESS_POSTGRES_USER: "witness"
-      WITNESS_POSTGRES_PASSWORD: "witness"
-      WITNESS_POSTGRES_DBNAME: "witness"
-      WITNESS_POSTGRES_SSLMODE: "disable"
-      WITNESS_WAL_DIR: "/data/wal"
+      HUBBLEOPS_POSTGRES_HOST: "postgres"
+      HUBBLEOPS_POSTGRES_PORT: "5432"
+      HUBBLEOPS_POSTGRES_USER: "hubbleops"
+      HUBBLEOPS_POSTGRES_PASSWORD: "hubbleops"
+      HUBBLEOPS_POSTGRES_DBNAME: "hubbleops"
+      HUBBLEOPS_POSTGRES_SSLMODE: "disable"
+      HUBBLEOPS_WAL_DIR: "/data/wal"
     depends_on:
       postgres:
         condition: service_healthy

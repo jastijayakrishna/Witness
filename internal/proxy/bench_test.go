@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/witness-proxy/witness-proxy/internal/loop"
-	"github.com/witness-proxy/witness-proxy/internal/providers"
-	"github.com/witness-proxy/witness-proxy/internal/wal"
+	"github.com/hubbleops/hubbleops/internal/loop"
+	"github.com/hubbleops/hubbleops/internal/providers"
+	"github.com/hubbleops/hubbleops/internal/wal"
 )
 
 func BenchmarkHandler_NonStream(b *testing.B) {

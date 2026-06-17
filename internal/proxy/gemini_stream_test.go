@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/witness-proxy/witness-proxy/internal/providers"
+	"github.com/hubbleops/hubbleops/internal/providers"
 )
 
 // TestHandler_StreamGemini verifies that requests to Gemini's streamGenerateContent

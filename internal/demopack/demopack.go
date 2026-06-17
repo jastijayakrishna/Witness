@@ -1,4 +1,4 @@
-// Package demopack embeds the famous-eight incident replays so `witness demo`
+// Package demopack embeds the famous-eight incident replays so `hubbleops demo`
 // works from the bare binary — install → wow with zero setup.
 package demopack
 
@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/witness-proxy/witness-proxy/internal/synthcorpus"
+	"github.com/hubbleops/hubbleops/internal/synthcorpus"
 )
 
 //go:embed data/*.jsonl

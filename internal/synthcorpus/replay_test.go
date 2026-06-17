@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/witness-proxy/witness-proxy/internal/loop"
+	"github.com/hubbleops/hubbleops/internal/loop"
 )
 
 func replayEvents(t *testing.T, events []Event) SessionResult {

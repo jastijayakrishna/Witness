@@ -28,7 +28,7 @@ jobs:
         run: go test ./...
 
       - name: JavaScript SDK syntax
-        run: node --check sdk/javascript/witness-agent/index.js
+        run: node --check sdk/javascript/hubbleops-agent/index.js
 
       - name: Python SDK syntax
-        run: python -m py_compile sdk/python/witness_agent/langchain.py sdk/python/witness_agent/__init__.py
+        run: python -m py_compile sdk/python/hubbleops_agent/langchain.py sdk/python/hubbleops_agent/__init__.py

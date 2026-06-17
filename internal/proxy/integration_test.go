@@ -12,9 +12,9 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
-	"github.com/witness-proxy/witness-proxy/internal/loop"
-	"github.com/witness-proxy/witness-proxy/internal/providers"
-	"github.com/witness-proxy/witness-proxy/internal/wal"
+	"github.com/hubbleops/hubbleops/internal/loop"
+	"github.com/hubbleops/hubbleops/internal/providers"
+	"github.com/hubbleops/hubbleops/internal/wal"
 )
 
 // TestBatchJobNeverBlocked_Integration verifies that a 200-turn changing-args
@@ -268,7 +268,7 @@ func TestRunawayWithSessionBlocks_Integration(t *testing.T) {
 	req1.Header.Set("Content-Type", "application/json")
 	req1.Header.Set("X-Project", project)
 	req1.Header.Set("X-Session-ID", sessionID)
-	req1.Header.Set("X-Witness-Override", overrideToken)
+	req1.Header.Set("X-HubbleOps-Override", overrideToken)
 
 	rec1 := httptest.NewRecorder()
 	h.ServeHTTP(rec1, req1)
@@ -283,7 +283,7 @@ func TestRunawayWithSessionBlocks_Integration(t *testing.T) {
 	req2.Header.Set("Content-Type", "application/json")
 	req2.Header.Set("X-Project", project)
 	req2.Header.Set("X-Session-ID", sessionID)
-	req2.Header.Set("X-Witness-Override", overrideToken)
+	req2.Header.Set("X-HubbleOps-Override", overrideToken)
 
 	rec2 := httptest.NewRecorder()
 	h.ServeHTTP(rec2, req2)

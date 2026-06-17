@@ -1,8 +1,7 @@
 # Build artifacts
 /proxy
 /waldrain
-/witness
-/loopreplay
+/hubbleops
 /bin/
 /dist/
 /tmp/

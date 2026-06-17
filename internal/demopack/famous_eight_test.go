@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/witness-proxy/witness-proxy/internal/loop"
-	"github.com/witness-proxy/witness-proxy/internal/synthcorpus"
+	"github.com/hubbleops/hubbleops/internal/loop"
+	"github.com/hubbleops/hubbleops/internal/synthcorpus"
 )
 
 // TestFamousEightDetected is bar #1: every demo incident must block, with the

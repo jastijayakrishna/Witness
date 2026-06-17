@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/witness-proxy/witness-proxy/internal/providers"
-	"github.com/witness-proxy/witness-proxy/internal/wal"
+	"github.com/hubbleops/hubbleops/internal/providers"
+	"github.com/hubbleops/hubbleops/internal/wal"
 )
 
 const defaultLiveGeminiModel = "gemini-2.5-flash-lite"
@@ -23,7 +23,7 @@ func TestLiveGeminiProxyGenerateContent(t *testing.T) {
 	handler.NonStreamTimeout = 30 * time.Second
 
 	body := `{
-		"contents":[{"role":"user","parts":[{"text":"Reply with exactly: witness-ok"}]}],
+		"contents":[{"role":"user","parts":[{"text":"Reply with exactly: hubbleops-ok"}]}],
 		"generationConfig":{"temperature":0,"maxOutputTokens":8}
 	}`
 	model := liveGeminiModel()
@@ -199,8 +199,8 @@ func TestLiveGeminiProxyInvalidKeyWritesWAL(t *testing.T) {
 
 func TestLiveGeminiProxyMiniSoakConcurrentWAL(t *testing.T) {
 	key := liveGeminiKey(t)
-	if os.Getenv("WITNESS_LIVE_GEMINI_SOAK") != "1" {
-		t.Skip("set WITNESS_LIVE_GEMINI_SOAK=1 to run the live Gemini mini-soak")
+	if os.Getenv("HUBBLEOPS_LIVE_GEMINI_SOAK") != "1" {
+		t.Skip("set HUBBLEOPS_LIVE_GEMINI_SOAK=1 to run the live Gemini mini-soak")
 	}
 	handler, walDir := newTestHandler(t)
 	handler.NonStreamTimeout = 30 * time.Second
@@ -261,8 +261,8 @@ func TestLiveGeminiProxyMiniSoakConcurrentWAL(t *testing.T) {
 
 func liveGeminiKey(t *testing.T) string {
 	t.Helper()
-	if os.Getenv("WITNESS_LIVE_GEMINI") != "1" {
-		t.Skip("set WITNESS_LIVE_GEMINI=1 to run live Gemini tests")
+	if os.Getenv("HUBBLEOPS_LIVE_GEMINI") != "1" {
+		t.Skip("set HUBBLEOPS_LIVE_GEMINI=1 to run live Gemini tests")
 	}
 	loadDotEnvForLiveTest(t)
 	key := firstNonEmptyLive(os.Getenv("GOOGLE_API_KEY"), os.Getenv("GEMINI_API_KEY"))
@@ -280,7 +280,7 @@ func liveGeminiKey(t *testing.T) string {
 }
 
 func liveGeminiModel() string {
-	if model := os.Getenv("WITNESS_LIVE_GEMINI_MODEL"); model != "" {
+	if model := os.Getenv("HUBBLEOPS_LIVE_GEMINI_MODEL"); model != "" {
 		return model
 	}
 	return defaultLiveGeminiModel

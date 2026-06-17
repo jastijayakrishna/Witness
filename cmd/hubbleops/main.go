@@ -15,15 +15,15 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/witness-proxy/witness-proxy/internal/config"
-	"github.com/witness-proxy/witness-proxy/internal/doctor"
-	"github.com/witness-proxy/witness-proxy/internal/evidencepack"
-	"github.com/witness-proxy/witness-proxy/internal/loop"
-	"github.com/witness-proxy/witness-proxy/internal/loopeval"
-	"github.com/witness-proxy/witness-proxy/internal/outcomeexport"
-	"github.com/witness-proxy/witness-proxy/internal/receiptverify"
-	"github.com/witness-proxy/witness-proxy/internal/shadowreport"
-	"github.com/witness-proxy/witness-proxy/internal/storage"
+	"github.com/hubbleops/hubbleops/internal/config"
+	"github.com/hubbleops/hubbleops/internal/doctor"
+	"github.com/hubbleops/hubbleops/internal/evidencepack"
+	"github.com/hubbleops/hubbleops/internal/loop"
+	"github.com/hubbleops/hubbleops/internal/loopeval"
+	"github.com/hubbleops/hubbleops/internal/outcomeexport"
+	"github.com/hubbleops/hubbleops/internal/receiptverify"
+	"github.com/hubbleops/hubbleops/internal/shadowreport"
+	"github.com/hubbleops/hubbleops/internal/storage"
 )
 
 func main() {
@@ -79,9 +79,9 @@ type reviewDecisionResult struct {
 
 func runReviewDecision(args []string) {
 	fs := flag.NewFlagSet("review-decision", flag.ExitOnError)
-	baseURL := fs.String("base-url", envOrDefault([]string{"WITNESS_BASE_URL", "WITNESS_URL"}, "http://localhost:8080"), "Witness base URL")
-	project := fs.String("project", envOrDefault([]string{"WITNESS_PROJECT", "WITNESS_PROJECT_KEY"}, ""), "Witness project")
-	apiKey := fs.String("api-key", envOrDefault([]string{"WITNESS_API_KEY", "WITNESS_PROJECT_KEY"}, ""), "Witness API key")
+	baseURL := fs.String("base-url", envOrDefault([]string{"HUBBLEOPS_BASE_URL", "HUBBLEOPS_URL"}, "http://localhost:8080"), "HubbleOps base URL")
+	project := fs.String("project", envOrDefault([]string{"HUBBLEOPS_PROJECT", "HUBBLEOPS_PROJECT_KEY"}, ""), "HubbleOps project")
+	apiKey := fs.String("api-key", envOrDefault([]string{"HUBBLEOPS_API_KEY", "HUBBLEOPS_PROJECT_KEY"}, ""), "HubbleOps API key")
 	decisionID := fs.String("decision", "", "decision id to review")
 	label := fs.String("label", "", "review label")
 	role := fs.String("role", "unknown", "reviewer role: developer, sre, security, founder, unknown")
@@ -113,7 +113,7 @@ func runReviewDecision(args []string) {
 		_ = enc.Encode(result)
 		return
 	}
-	fmt.Printf("Witness decision review\n")
+	fmt.Printf("HubbleOps decision review\n")
 	fmt.Printf("decision_id=%s label=%s role=%s source=%s\n", result.DecisionID, result.Label, result.ReviewerRole, result.ReviewerSource)
 	if result.NotesFingerprint != "" {
 		fmt.Printf("notes_fingerprint=%s\n", result.NotesFingerprint)
@@ -151,7 +151,7 @@ func submitDecisionReview(ctx context.Context, cfg reviewDecisionConfig) (review
 		req.Header.Set("X-Project", cfg.Project)
 	}
 	if cfg.APIKey != "" {
-		req.Header.Set("X-Witness-API-Key", cfg.APIKey)
+		req.Header.Set("X-HubbleOps-API-Key", cfg.APIKey)
 	}
 	client := &http.Client{Timeout: cfg.Timeout}
 	resp, err := client.Do(req)
@@ -161,7 +161,7 @@ func submitDecisionReview(ctx context.Context, cfg reviewDecisionConfig) (review
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return result, fmt.Errorf("Witness returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+		return result, fmt.Errorf("HubbleOps returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
 	if err := json.Unmarshal(respBody, &result); err != nil {
 		return result, fmt.Errorf("parse review response: %w", err)
@@ -171,14 +171,14 @@ func submitDecisionReview(ctx context.Context, cfg reviewDecisionConfig) (review
 
 func runExportOutcomes(args []string) {
 	fs := flag.NewFlagSet("export-outcomes", flag.ExitOnError)
-	project := fs.String("project", envOrDefault([]string{"WITNESS_PROJECT"}, ""), "project to export")
+	project := fs.String("project", envOrDefault([]string{"HUBBLEOPS_PROJECT"}, ""), "project to export")
 	sinceRaw := fs.String("since", "", "inclusive UTC day, e.g. 2026-01-01")
 	outPath := fs.String("out", "", "output JSONL path")
 	anonymize := fs.Bool("anonymize", true, "required; non-anonymized export is not supported")
-	saltEnv := fs.String("salt-env", "WITNESS_ANON_SALT", "environment variable containing anonymization salt")
+	saltEnv := fs.String("salt-env", "HUBBLEOPS_ANON_SALT", "environment variable containing anonymization salt")
 	includeCostExact := fs.Bool("include-cost-exact", false, "include exact estimated_cost_usd; default exports buckets only")
 	reviewedOnly := fs.Bool("reviewed-only", false, "exclude decisions without a customer review label")
-	configPath := fs.String("config", "configs/proxy.yaml", "Witness config path")
+	configPath := fs.String("config", "configs/proxy.yaml", "HubbleOps config path")
 	timeout := fs.Duration("timeout", 15*time.Second, "export timeout")
 	_ = fs.Parse(args)
 
@@ -282,9 +282,9 @@ func createExportOutput(path string) (io.Writer, func() error, error) {
 
 func runDoctor(args []string) {
 	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
-	baseURL := fs.String("base-url", envOrDefault([]string{"WITNESS_BASE_URL", "WITNESS_URL"}, "http://localhost:8080"), "Witness base URL")
-	project := fs.String("project", envOrDefault([]string{"WITNESS_PROJECT", "WITNESS_PROJECT_KEY"}, "witness-doctor"), "Witness project")
-	apiKey := fs.String("api-key", envOrDefault([]string{"WITNESS_API_KEY", "WITNESS_PROJECT_KEY"}, ""), "Witness API key")
+	baseURL := fs.String("base-url", envOrDefault([]string{"HUBBLEOPS_BASE_URL", "HUBBLEOPS_URL"}, "http://localhost:8080"), "HubbleOps base URL")
+	project := fs.String("project", envOrDefault([]string{"HUBBLEOPS_PROJECT", "HUBBLEOPS_PROJECT_KEY"}, "hubbleops-doctor"), "HubbleOps project")
+	apiKey := fs.String("api-key", envOrDefault([]string{"HUBBLEOPS_API_KEY", "HUBBLEOPS_PROJECT_KEY"}, ""), "HubbleOps API key")
 	timeout := fs.Duration("timeout", 2*time.Second, "per-check timeout")
 	jsonOut := fs.Bool("json", false, "print JSON")
 	_ = fs.Parse(args)
@@ -304,7 +304,7 @@ func runDoctor(args []string) {
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(report)
 	} else {
-		fmt.Printf("Witness doctor\n")
+		fmt.Printf("HubbleOps doctor\n")
 		fmt.Printf("base_url: %s\n", report.BaseURL)
 		for _, check := range report.Checks {
 			status := "ok"
@@ -355,7 +355,7 @@ func runShadowReport(args []string) {
 		os.Exit(2)
 	}
 
-	fmt.Printf("Witness shadow report\n")
+	fmt.Printf("HubbleOps shadow report\n")
 	fmt.Printf("records=%d tool_events=%d total_action_decisions=%d\n", report.TotalRecords, report.ToolEvents, report.TotalActionDecisions)
 	fmt.Printf("would_block_decisions=%d blocked=%d duplicate_side_effect_decisions=%d no_progress_decisions=%d budget_decisions=%d\n",
 		report.WouldBlockDecisions, report.Blocked, report.DuplicateSideEffectDecisions, report.NoProgressDecisions, report.BudgetDecisions)
@@ -370,8 +370,8 @@ func runShadowReport(args []string) {
 	if len(report.RecommendedReviewSample) > 0 {
 		fmt.Printf("review_queue\n")
 		for _, item := range report.RecommendedReviewSample {
-			fmt.Printf("- decision_id=%s action_name=%s witness_action=%s risk_class=%s result_class=%s estimated_cost_usd=%.6f estimated_risk=%s\n",
-				item.DecisionID, item.ActionName, item.WitnessAction, item.RiskClass, item.ResultClass, item.EstimatedCostUSD, item.EstimatedRisk)
+			fmt.Printf("- decision_id=%s action_name=%s hubbleops_action=%s risk_class=%s result_class=%s estimated_cost_usd=%.6f estimated_risk=%s\n",
+				item.DecisionID, item.ActionName, item.HubbleOpsAction, item.RiskClass, item.ResultClass, item.EstimatedCostUSD, item.EstimatedRisk)
 			if item.Reason != "" {
 				fmt.Printf("  reason=%s\n", item.Reason)
 			}
@@ -391,8 +391,8 @@ func runEvidencePack(args []string) {
 	sinceRaw := fs.String("since", "", "inclusive start day, YYYY-MM-DD")
 	untilRaw := fs.String("until", "", "exclusive end day, YYYY-MM-DD")
 	project := fs.String("project", "", "limit to a single project")
-	receiptPublicKey := fs.String("receipt-public-key", os.Getenv("WITNESS_RECEIPT_PUBLIC_KEY"), "base64 Ed25519 receipt public key; verifies signatures without the signing secret")
-	receiptSecret := fs.String("receipt-secret", os.Getenv("WITNESS_RECEIPT_SIGNING_SECRET"), "receipt signing secret (operator path)")
+	receiptPublicKey := fs.String("receipt-public-key", os.Getenv("HUBBLEOPS_RECEIPT_PUBLIC_KEY"), "base64 Ed25519 receipt public key; verifies signatures without the signing secret")
+	receiptSecret := fs.String("receipt-secret", os.Getenv("HUBBLEOPS_RECEIPT_SIGNING_SECRET"), "receipt signing secret (operator path)")
 	out := fs.String("out", "", "write the pack to this file instead of stdout")
 	_ = fs.Parse(args)
 
@@ -470,12 +470,12 @@ func runEvidencePack(args []string) {
 func runVerifyReceipts(args []string) {
 	fs := flag.NewFlagSet("verify-receipts", flag.ExitOnError)
 	jsonOut := fs.Bool("json", false, "print JSON")
-	receiptSecret := fs.String("receipt-secret", os.Getenv("WITNESS_RECEIPT_SIGNING_SECRET"), "receipt signing secret; defaults to WITNESS_RECEIPT_SIGNING_SECRET")
-	receiptPublicKey := fs.String("receipt-public-key", os.Getenv("WITNESS_RECEIPT_PUBLIC_KEY"), "base64 Ed25519 receipt public key; verify receipts without the signing secret")
+	receiptSecret := fs.String("receipt-secret", os.Getenv("HUBBLEOPS_RECEIPT_SIGNING_SECRET"), "receipt signing secret; defaults to HUBBLEOPS_RECEIPT_SIGNING_SECRET")
+	receiptPublicKey := fs.String("receipt-public-key", os.Getenv("HUBBLEOPS_RECEIPT_PUBLIC_KEY"), "base64 Ed25519 receipt public key; verify receipts without the signing secret")
 	requireSignatures := fs.Bool("require-signatures", false, "fail verification if any action receipt is unsigned")
 	_ = fs.Parse(args)
 	if *requireSignatures && *receiptSecret == "" && *receiptPublicKey == "" {
-		fmt.Fprintln(os.Stderr, "-require-signatures needs -receipt-public-key (or -receipt-secret / WITNESS_RECEIPT_SIGNING_SECRET)")
+		fmt.Fprintln(os.Stderr, "-require-signatures needs -receipt-public-key (or -receipt-secret / HUBBLEOPS_RECEIPT_SIGNING_SECRET)")
 		os.Exit(1)
 	}
 
@@ -495,7 +495,7 @@ func runVerifyReceipts(args []string) {
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(report)
 	} else {
-		fmt.Printf("Witness receipt verify\n")
+		fmt.Printf("HubbleOps receipt verify\n")
 		fmt.Printf("records=%d action_receipts=%d signed_receipts=%d unsigned_receipts=%d verified=%t\n",
 			report.TotalRecords, report.ActionReceipts, report.SignedReceipts, report.UnsignedReceipts, report.Verified)
 		fmt.Printf("missing_hashes=%d hash_mismatches=%d signature_mismatches=%d chain_broken_at=%d receipt_field_gaps=%d\n",
@@ -524,7 +524,7 @@ func runEval(args []string) {
 	jsonOut := fs.Bool("json", false, "print JSON")
 	assertMode := fs.Bool("assert", false, "exit non-zero if quality gates fail")
 	anonymizeOut := fs.String("anonymize-out", "", "write privacy-safe JSONL copy")
-	salt := fs.String("salt", os.Getenv("WITNESS_ANON_SALT"), "salt for anonymized IDs")
+	salt := fs.String("salt", os.Getenv("HUBBLEOPS_ANON_SALT"), "salt for anonymized IDs")
 	maxFP := fs.Float64("max-fp-block-rate", 0, "maximum false positive block rate")
 	maxMiss := fs.Float64("max-missed-runaway-rate", 0, "maximum missed runaway rate")
 	minRecall := fs.Float64("min-runaway-recall", 1, "minimum runaway recall")
@@ -544,7 +544,7 @@ func runEval(args []string) {
 
 	if *anonymizeOut != "" {
 		if *salt == "" {
-			fmt.Fprintln(os.Stderr, "-salt or WITNESS_ANON_SALT is required with -anonymize-out")
+			fmt.Fprintln(os.Stderr, "-salt or HUBBLEOPS_ANON_SALT is required with -anonymize-out")
 			os.Exit(1)
 		}
 		f, err := os.Create(*anonymizeOut)
@@ -576,7 +576,7 @@ func runEval(args []string) {
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(report)
 	} else {
-		fmt.Printf("Witness loop eval\n")
+		fmt.Printf("HubbleOps loop eval\n")
 		fmt.Printf("traces=%d events=%d runaways=%d legit=%d\n", report.TotalTraces, report.TotalEvents, report.RunawayTraces, report.LegitTraces)
 		fmt.Printf("recall=%.4f precision=%.4f fp_block_rate=%.4f missed_runaway_rate=%.4f\n",
 			report.RunawayRecall, report.BlockPrecision, report.FalsePositiveBlockRate, report.MissedRunawayRate)
@@ -661,5 +661,5 @@ func envOrDefault(names []string, fallback string) string {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: witness demo|doctor|eval|shadow-report|evidence-pack|verify-receipts|review-decision|export-outcomes [flags]")
+	fmt.Fprintln(os.Stderr, "usage: hubbleops demo|doctor|eval|shadow-report|evidence-pack|verify-receipts|review-decision|export-outcomes [flags]")
 }

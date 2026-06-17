@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/witness-proxy/witness-proxy/internal/loop"
+	"github.com/hubbleops/hubbleops/internal/loop"
 )
 
 func TestEvaluateReportsProductionMetrics(t *testing.T) {
@@ -83,7 +83,7 @@ func TestAnonymizeFingerprintsSensitiveData(t *testing.T) {
 	if strings.Contains(encoded, "user@example.com") || strings.Contains(encoded, "token") || strings.Contains(encoded, "state-raw") {
 		t.Fatalf("anonymized output leaked sensitive data: %s", encoded)
 	}
-	if !strings.Contains(encoded, "witness_capture") {
+	if !strings.Contains(encoded, "hubbleops_capture") {
 		t.Fatalf("anonymized output missing fingerprint marker: %s", encoded)
 	}
 }

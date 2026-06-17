@@ -5,7 +5,7 @@ A generator (`synthgen.py`) + starter corpus (3,000 sessions / 70,517 events / 3
 
 - **21 positive families** (must flag) — each mapped to a documented public incident from your evidence table (`source_incident` field: A4, A5, A6, A7, A10, A11, A12, A17/A18, A20, A1-A3, A27, B14, B16, B21) plus adversarial variants (chaff interleaving, paraphrased args, fake-progress jitter, pending suppression, slow loops, multi-tool cycles, fan-out).
 - **11 negative families** (must NOT flag) — the false-positive traps: exponential-backoff retries, opaque polling, pagination, batches, cron repeats with long gaps, sub-threshold repeated reads, concurrent agents, streaming retries, well-keyed writes.
-- **Demo pack** — 8 deterministic replays with dollar arcs matching the published numbers ($34,895 Cloudflare, $260 OpenAI overnight, $13.55 Aider, the Replit prod delete, LangGraph #7417 re-dispatch, the duplicate refund). Embedded in `internal/demopack/data/`; this is the `witness demo` content.
+- **Demo pack** — 8 deterministic replays with dollar arcs matching the published numbers ($34,895 Cloudflare, $260 OpenAI overnight, $13.55 Aider, the Replit prod delete, LangGraph #7417 re-dispatch, the duplicate refund). Embedded in `internal/demopack/data/`; this is the `hubbleops demo` content.
 
 ## How to run it (against the real detector — never a port)
 
@@ -17,7 +17,7 @@ go test ./internal/synthcorpus/ -run TestSyntheticCorpusScoreboard -v
 go test ./internal/demopack/ -run TestFamousEightDetected -v
 
 # The 2-minute wow (embedded demo pack, no setup):
-go run ./cmd/witness demo
+go run ./cmd/hubbleops demo
 
 # Regenerate the corpus (deterministic):
 python synthgen.py --out starter_corpus_3000 --sessions 3000 --seed 7
@@ -33,7 +33,7 @@ lives embedded in `internal/demopack/data/`.
 1. **Famous eight: 8/8.** Every demo-pack incident detected with the right signal. If your detector misses one of these on stage, nothing else matters.
 2. **Positives ≥ 95% per family** — not aggregate. An aggregate hides a dead family. Misses come back to me as JSONL; we fix the detector, not the test.
 3. **Negatives: 0 blocks, ≤ 1% warns per family** at default shadow→warn thresholds. `legit_backoff_retry` and `polling_opaque_then_done` are the two that kill customer trust — they must be perfect.
-4. **Install → wow ≤ 2 minutes:** `witness demo` bundles the demo pack, replays it through the real pipeline in-memory, prints the shadow report with incident names, signals, and dollar figures. The customer sees "$34,895 runaway blocked at event 14" before they've wired a single line of their own traffic.
+4. **Install → wow ≤ 2 minutes:** `hubbleops demo` bundles the demo pack, replays it through the real pipeline in-memory, prints the shadow report with incident names, signals, and dollar figures. The customer sees "$34,895 runaway blocked at event 14" before they've wired a single line of their own traffic.
 5. **Quickstart ≤ 10 minutes** on a clean machine to first receipt from their own agent.
 
 ## Scaling to the million

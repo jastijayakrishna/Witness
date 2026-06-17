@@ -9,9 +9,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/witness-proxy/witness-proxy/internal/demopack"
-	"github.com/witness-proxy/witness-proxy/internal/loop"
-	"github.com/witness-proxy/witness-proxy/internal/synthcorpus"
+	"github.com/hubbleops/hubbleops/internal/demopack"
+	"github.com/hubbleops/hubbleops/internal/loop"
+	"github.com/hubbleops/hubbleops/internal/synthcorpus"
 )
 
 func runDemo(args []string) {
@@ -63,7 +63,7 @@ func renderDemoReport(w io.Writer, jsonOut bool) (int, error) {
 		return missed, json.NewEncoder(w).Encode(rows)
 	}
 
-	fmt.Fprintln(w, "WITNESS DEMO — famous incidents replayed through the real pipeline (synthetic replays)")
+	fmt.Fprintln(w, "HUBBLEOPS DEMO — famous incidents replayed through the real pipeline (synthetic replays)")
 	fmt.Fprintln(w)
 	for _, r := range rows {
 		res := r.Result

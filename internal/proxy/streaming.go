@@ -13,7 +13,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 
-	"github.com/witness-proxy/witness-proxy/internal/providers"
+	"github.com/hubbleops/hubbleops/internal/providers"
 )
 
 func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, provider *providers.Provider, body []byte, project, sessionID string, overridden, budgetReserved bool) {

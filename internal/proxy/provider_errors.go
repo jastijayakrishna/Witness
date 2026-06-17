@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/witness-proxy/witness-proxy/internal/loop"
+	"github.com/hubbleops/hubbleops/internal/loop"
 )
 
 func classifyProviderResponse(statusCode int, body []byte) string {

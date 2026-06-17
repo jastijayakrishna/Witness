@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/witness-proxy/witness-proxy/internal/loop"
+	"github.com/hubbleops/hubbleops/internal/loop"
 )
 
 type Event struct {
@@ -388,7 +388,7 @@ func fingerprintValue(value any) map[string]any {
 	}
 	sum := sha256.Sum256(data)
 	return map[string]any{
-		"witness_capture": "fingerprint",
+		"hubbleops_capture": "fingerprint",
 		"sha256":          hex.EncodeToString(sum[:]),
 		"type":            fmt.Sprintf("%T", value),
 	}

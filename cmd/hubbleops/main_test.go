@@ -17,7 +17,7 @@ func TestSubmitDecisionReviewPostsReview(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		gotProject = r.Header.Get("X-Project")
-		gotAPIKey = r.Header.Get("X-Witness-API-Key")
+		gotAPIKey = r.Header.Get("X-HubbleOps-API-Key")
 		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
 			t.Fatalf("decode request: %v", err)
 		}
@@ -29,7 +29,7 @@ func TestSubmitDecisionReviewPostsReview(t *testing.T) {
 	result, err := submitDecisionReview(context.Background(), reviewDecisionConfig{
 		BaseURL:    srv.URL,
 		Project:    "proj-a",
-		APIKey:     "witness_live_test",
+		APIKey:     "hubbleops_live_test",
 		DecisionID: "dec_1",
 		Label:      "true_positive",
 		Role:       "sre",
@@ -42,7 +42,7 @@ func TestSubmitDecisionReviewPostsReview(t *testing.T) {
 	if gotPath != "/v1/decisions/dec_1/review" {
 		t.Fatalf("path=%q", gotPath)
 	}
-	if gotProject != "proj-a" || gotAPIKey != "witness_live_test" {
+	if gotProject != "proj-a" || gotAPIKey != "hubbleops_live_test" {
 		t.Fatalf("headers project=%q api_key=%q", gotProject, gotAPIKey)
 	}
 	if gotBody["label"] != "true_positive" || gotBody["reviewer_role"] != "sre" || gotBody["notes"] != "looks correct" {

@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/witness-proxy/witness-proxy/internal/providers"
+	"github.com/hubbleops/hubbleops/internal/providers"
 )
 
 // --- Fault Injection Tests ---
