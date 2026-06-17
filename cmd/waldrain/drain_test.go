@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/witness-proxy/witness-proxy/internal/wal"
+	"github.com/hubbleops/hubbleops/internal/wal"
 )
 
 // TestDrainOffsetReset is a regression test for the critical midnight UTC bug:

@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -18,27 +21,27 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
-	"github.com/witness-proxy/witness-proxy/internal/config"
-	"github.com/witness-proxy/witness-proxy/internal/loop"
-	"github.com/witness-proxy/witness-proxy/internal/providers"
-	"github.com/witness-proxy/witness-proxy/internal/proxy"
-	"github.com/witness-proxy/witness-proxy/internal/receipts"
-	"github.com/witness-proxy/witness-proxy/internal/storage"
-	"github.com/witness-proxy/witness-proxy/internal/wal"
-	"net/url"
+	"github.com/hubbleops/hubbleops/internal/auth"
+	"github.com/hubbleops/hubbleops/internal/config"
+	"github.com/hubbleops/hubbleops/internal/loop"
+	"github.com/hubbleops/hubbleops/internal/providers"
+	"github.com/hubbleops/hubbleops/internal/proxy"
+	"github.com/hubbleops/hubbleops/internal/receipts"
+	"github.com/hubbleops/hubbleops/internal/storage"
+	"github.com/hubbleops/hubbleops/internal/wal"
 )
 
 var (
 	requestsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "witness_http_requests_total",
+			Name: "hubbleops_http_requests_total",
 			Help: "Total HTTP requests by method and status.",
 		},
 		[]string{"method", "status"},
 	)
 	requestDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name:    "witness_http_request_duration_seconds",
+			Name:    "hubbleops_http_request_duration_seconds",
 			Help:    "HTTP request duration in seconds.",
 			Buckets: prometheus.DefBuckets,
 		},
@@ -57,7 +60,7 @@ func main() {
 	log.Logger = zerolog.New(os.Stdout).With().Timestamp().Caller().Logger()
 
 	// Config
-	cfgPath := os.Getenv("WITNESS_CONFIG")
+	cfgPath := os.Getenv("HUBBLEOPS_CONFIG")
 	if cfgPath == "" {
 		cfgPath = "configs/proxy.yaml"
 	}
@@ -68,21 +71,33 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to load config")
 	}
+	runtimeSecrets := config.RuntimeSecrets{
+		ReceiptSigningSecretSet:   secretSet("HUBBLEOPS_RECEIPT_SIGNING_SECRET"),
+		ActionCapabilitySecretSet: secretSet("HUBBLEOPS_ACTION_CAPABILITY_SECRET"),
+	}
+	validation, err := cfg.Validate(runtimeSecrets)
+	log.Info().Interface("config", cfg.RedactedSummary(runtimeSecrets)).Msg("HubbleOps startup config summary")
+	for _, warning := range validation.Warnings {
+		log.Warn().Str("warning", warning).Msg("unsafe HubbleOps configuration")
+	}
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed config safety validation")
+	}
 
 	// Override provider targets from env vars (for testing/dev with mock servers)
-	if targetURL := os.Getenv("WITNESS_OPENAI_TARGET"); targetURL != "" {
+	if targetURL := os.Getenv("HUBBLEOPS_OPENAI_TARGET"); targetURL != "" {
 		if u, err := url.Parse(targetURL); err == nil {
 			if p := providers.Registry["/openai"]; p != nil {
 				p.Target = u
-				log.Info().Str("target", targetURL).Msg("OpenAI target overridden")
+				log.Info().Str("target", config.RedactURL(targetURL)).Msg("OpenAI target overridden")
 			}
 		}
 	}
-	if targetURL := os.Getenv("WITNESS_ANTHROPIC_TARGET"); targetURL != "" {
+	if targetURL := os.Getenv("HUBBLEOPS_ANTHROPIC_TARGET"); targetURL != "" {
 		if u, err := url.Parse(targetURL); err == nil {
 			if p := providers.Registry["/anthropic"]; p != nil {
 				p.Target = u
-				log.Info().Str("target", targetURL).Msg("Anthropic target overridden")
+				log.Info().Str("target", config.RedactURL(targetURL)).Msg("Anthropic target overridden")
 			}
 		}
 	}
@@ -91,7 +106,7 @@ func main() {
 	defer cancel()
 
 	// Postgres
-	log.Info().Str("dsn", cfg.Postgres.DSN()).Msg("connecting to postgres")
+	log.Info().Str("dsn", cfg.Postgres.RedactedDSN()).Msg("connecting to postgres")
 	poolCfg, err := pgxpool.ParseConfig(cfg.Postgres.DSN())
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to parse postgres dsn")
@@ -156,6 +171,7 @@ func main() {
 		WarnConfidence:         cfg.LoopDetection.WarnConfidence,
 		BlockConfidence:        cfg.LoopDetection.BlockConfidence,
 		RequireSessionForBlock: cfg.LoopDetection.RequireSessionForBlock,
+		ToolRiskFloor:          cfg.LoopDetection.ToolRiskFloors,
 	}
 
 	// Override tokens
@@ -175,29 +191,99 @@ func main() {
 			Msg("budget enforcement enabled")
 	}
 
+	// Resource limits: cumulative caps, velocity, circuit breaker
+	var limitStore *loop.LimitStore
+	if limitsCfg := buildLimitsConfig(cfg.Limits); limitsCfg.Enabled() {
+		limitStore = loop.NewLimitStore(rdb, limitsCfg)
+		log.Info().
+			Int("cumulative_rules", len(limitsCfg.Cumulative)).
+			Int("velocity_rules", len(limitsCfg.Velocity)).
+			Int("breaker_trips", limitsCfg.Breaker.Trips).
+			Msg("resource limits enabled")
+	}
+
 	// Alerter
 	var alerter *loop.Alerter
 	if cfg.Alerts.WebhookURL != "" {
 		alerter = loop.NewAlerter(cfg.Alerts.WebhookURL, rdb)
-		log.Info().Str("webhook_url", cfg.Alerts.WebhookURL).Msg("alerter enabled")
+		log.Info().Str("webhook_url", config.RedactURL(cfg.Alerts.WebhookURL)).Msg("alerter enabled")
 	}
 
 	// Proxy handler
 	proxyHandler := proxy.NewHandler(walWriter, loopStore, loopCfg)
-	proxyHandler.ActionStore = loop.NewPostgresActionStore(pgPool).WithCapabilitySecret(os.Getenv("WITNESS_ACTION_CAPABILITY_SECRET"))
-	if receiptSecret := os.Getenv("WITNESS_RECEIPT_SIGNING_SECRET"); receiptSecret != "" {
-		keyID := os.Getenv("WITNESS_RECEIPT_KEY_ID")
-		proxyHandler.ReceiptSigner = receipts.NewSigner(keyID, []byte(receiptSecret))
+	proxyHandler.ActionStore = loop.NewPostgresActionStore(pgPool).WithCapabilitySecret(os.Getenv("HUBBLEOPS_ACTION_CAPABILITY_SECRET"))
+	if receiptSecret := os.Getenv("HUBBLEOPS_RECEIPT_SIGNING_SECRET"); receiptSecret != "" {
+		keyID := os.Getenv("HUBBLEOPS_RECEIPT_KEY_ID")
+		signer := receipts.NewSigner(keyID, []byte(receiptSecret))
+		proxyHandler.ReceiptSigner = signer
 		logKeyID := keyID
 		if logKeyID == "" {
 			logKeyID = "local"
 		}
-		log.Info().Str("key_id", logKeyID).Msg("receipt signing enabled")
+		// Publish the Ed25519 public key on startup so operators can hand it to auditors,
+		// who can then verify receipts (hubbleops verify-receipts -receipt-public-key ...)
+		// without ever holding the signing secret.
+		log.Info().
+			Str("key_id", logKeyID).
+			Str("algorithm", "ed25519").
+			Str("public_key", signer.PublicKeyBase64()).
+			Msg("receipt signing enabled; publish public_key for external verification")
 	}
 	proxyHandler.OverrideStore = overrideStore
+	proxyHandler.LimitStore = limitStore
 	proxyHandler.BudgetEnforcer = budgetEnforcer
 	proxyHandler.Alerter = alerter
 	proxyHandler.DB = pgPool
+	moatStore := storage.NewMoatStore(pgPool)
+	if cfg.OutcomeCapture.Enabled {
+		proxyHandler.OutcomeStore = moatStore
+		proxyHandler.OutcomeCapture = proxy.OutcomeCaptureConfig{
+			Enabled: true,
+			Mode:    cfg.OutcomeCapture.Mode,
+			Raw:     cfg.OutcomeCapture.Raw,
+		}
+		log.Info().Str("mode", cfg.OutcomeCapture.Mode).Bool("raw", cfg.OutcomeCapture.Raw).Msg("data moat outcome capture enabled")
+	}
+	proxyHandler.DecisionReviewStore = moatStore
+	proxyHandler.ReviewRawNotes = cfg.Reviews.RawNotes
+	proxyHandler.RawCaptureEnabled = cfg.Capture.Mode == config.CaptureModeRaw
+	if cfg.Reviews.RawNotes {
+		log.Warn().Msg("raw decision review notes enabled")
+	}
+	proxyHandler.RequireReceiptForBlock = cfg.Receipts.RequireForBlock
+	proxyHandler.EnforceWithoutReceipt = cfg.Receipts.EnforceWithoutReceipt
+	if cfg.Receipts.EnforceWithoutReceipt {
+		log.Error().Msg("CRITICAL: HubbleOps may enforce blocks without durable receipts")
+	}
+
+	// Durable receipt recovery: any decision receipt that fails its WAL write while a
+	// block is enforced is persisted to an on-disk dead-letter queue and replayed once
+	// the WAL recovers. Because the queue lives on disk under the WAL dir, recovery
+	// survives process restarts — not just transient in-process retries.
+	if deadLetter, dlErr := wal.NewDeadLetter(cfg.WAL.Dir); dlErr != nil {
+		log.Error().Err(dlErr).Msg("failed to initialize receipt dead-letter queue; durable receipt recovery disabled")
+	} else {
+		proxyHandler.ReceiptQueue = deadLetter
+		proxyHandler.StartReceiptDrainer(30*time.Second, ctx.Done())
+		log.Info().Str("dir", cfg.WAL.Dir).Msg("durable receipt dead-letter recovery enabled")
+	}
+
+	authMiddleware := auth.Middleware(auth.Options{
+		Store:         auth.NewPostgresKeyStore(pgPool),
+		Enabled:       cfg.Auth.Enabled,
+		DevBypass:     cfg.Auth.DevBypass,
+		Environment:   cfg.Environment,
+		MetricsPublic: cfg.Auth.MetricsPublic,
+	})
+	if !cfg.Auth.Enabled {
+		log.Warn().Msg("HubbleOps API-key auth disabled; do not use this setting in production")
+	}
+	if cfg.Auth.DevBypass {
+		log.Warn().Msg("HubbleOps dev auth bypass enabled; only safe for local development")
+	}
+	if cfg.Auth.MetricsPublic {
+		log.Warn().Msg("HubbleOps metrics endpoint is public")
+	}
 
 	// Router
 	r := chi.NewRouter()
@@ -205,32 +291,43 @@ func main() {
 	r.Use(middleware.RequestID)
 	r.Use(metricsMiddleware)
 
-	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		if err := pgPool.Ping(r.Context()); err != nil {
-			http.Error(w, `{"status":"unhealthy","error":"postgres"}`, http.StatusServiceUnavailable)
-			return
-		}
-		if err := rdb.Ping(r.Context()).Err(); err != nil {
-			http.Error(w, `{"status":"unhealthy","error":"redis"}`, http.StatusServiceUnavailable)
-			return
-		}
+	r.Get("/livez", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, `{"status":"healthy"}`)
+		fmt.Fprint(w, `{"status":"alive"}`)
+	})
+	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		writeReadiness(w, r, pgPool, rdb, walWriter)
+	})
+	r.Get("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		writeReadiness(w, r, pgPool, rdb, walWriter)
 	})
 
-	r.Handle("/metrics", promhttp.Handler())
+	// Public, unauthenticated: anyone can fetch the receipt verification key. A public
+	// key grants verification, never signing, so it is safe to expose.
+	r.Get("/v1/receipts/public-key", proxyHandler.HandleReceiptPublicKey)
+	r.Get("/.well-known/hubbleops-receipt-key", proxyHandler.HandleReceiptPublicKey)
+
+	if cfg.Auth.MetricsPublic {
+		r.Handle("/metrics", promhttp.Handler())
+	} else {
+		r.With(authMiddleware).Handle("/metrics", promhttp.Handler())
+	}
 
 	// Mount proxy routes for each provider. Concurrency is bounded by the
 	// Handler's inflight semaphore (with metrics + 503 shedding), so no
 	// chi-level throttle is needed.
-	r.Handle("/openai/*", proxyHandler)
-	r.Handle("/anthropic/*", proxyHandler)
-	r.Handle("/gemini/*", proxyHandler)
-	r.Post("/v1/action/check", proxyHandler.HandleActionCheck)
-	r.Post("/v1/action/result", proxyHandler.HandleActionResult)
-	r.Post("/v1/tool/check", proxyHandler.HandleToolCheck)
-	r.Post("/v1/tool/result", proxyHandler.HandleToolResult)
+	r.Group(func(protected chi.Router) {
+		protected.Use(authMiddleware)
+		protected.Handle("/openai/*", proxyHandler)
+		protected.Handle("/anthropic/*", proxyHandler)
+		protected.Handle("/gemini/*", proxyHandler)
+		protected.Post("/v1/action/check", proxyHandler.HandleActionCheck)
+		protected.Post("/v1/action/result", proxyHandler.HandleActionResult)
+		protected.Post("/v1/tool/check", proxyHandler.HandleToolCheck)
+		protected.Post("/v1/tool/result", proxyHandler.HandleToolResult)
+		protected.Post("/v1/decisions/{decision_id}/review", proxyHandler.HandleDecisionReview)
+	})
 
 	// Server
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
@@ -271,6 +368,49 @@ func main() {
 	log.Info().Msg("server stopped")
 }
 
+func writeReadiness(w http.ResponseWriter, r *http.Request, pgPool *pgxpool.Pool, rdb *redis.Client, walWriter *wal.Writer) {
+	body := map[string]string{
+		"status":   "healthy",
+		"postgres": "ok",
+		"redis":    "ok",
+		"wal":      "ok",
+	}
+	if err := pgPool.Ping(r.Context()); err != nil {
+		body["status"] = "unhealthy"
+		body["postgres"] = "error"
+		body["error"] = "postgres"
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(body)
+		return
+	}
+	if err := rdb.Ping(r.Context()).Err(); err != nil {
+		body["status"] = "unhealthy"
+		body["redis"] = "error"
+		body["error"] = "redis"
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(body)
+		return
+	}
+	if err := walWriter.CheckWritable(); err != nil {
+		body["status"] = "unhealthy"
+		body["wal"] = "error"
+		body["error"] = "wal"
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(body)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(body)
+}
+
+func secretSet(name string) bool {
+	return strings.TrimSpace(os.Getenv(name)) != ""
+}
+
 func metricsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -281,4 +421,36 @@ func metricsMiddleware(next http.Handler) http.Handler {
 		requestsTotal.WithLabelValues(r.Method, status).Inc()
 		requestDuration.WithLabelValues(r.Method).Observe(duration)
 	})
+}
+
+// buildLimitsConfig converts the yaml limits section into the loop package's
+// rule types. Validation already ran at startup, so rules arrive well-formed.
+func buildLimitsConfig(cfg config.LimitsConfig) loop.LimitsConfig {
+	out := loop.LimitsConfig{
+		Breaker: loop.BreakerRule{
+			Trips:           cfg.Breaker.Trips,
+			WindowSeconds:   cfg.Breaker.WindowSeconds,
+			CooldownSeconds: cfg.Breaker.CooldownSeconds,
+		},
+	}
+	for _, rule := range cfg.Cumulative {
+		out.Cumulative = append(out.Cumulative, loop.CumulativeRule{
+			Name:           rule.Name,
+			Tool:           rule.Tool,
+			Scope:          rule.Scope,
+			WindowSeconds:  rule.WindowSeconds,
+			MaxAmountCents: rule.MaxAmountCents,
+		})
+	}
+	for _, rule := range cfg.Velocity {
+		out.Velocity = append(out.Velocity, loop.VelocityRule{
+			Name:          rule.Name,
+			Tool:          rule.Tool,
+			MinRisk:       rule.MinRisk,
+			Scope:         rule.Scope,
+			WindowSeconds: rule.WindowSeconds,
+			MaxActions:    rule.MaxActions,
+		})
+	}
+	return out
 }

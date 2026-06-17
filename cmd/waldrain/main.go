@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -20,9 +21,8 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
-	"github.com/witness-proxy/witness-proxy/internal/config"
-	"github.com/witness-proxy/witness-proxy/internal/wal"
-	"net/http"
+	"github.com/hubbleops/hubbleops/internal/config"
+	"github.com/hubbleops/hubbleops/internal/wal"
 )
 
 const (
@@ -84,7 +84,7 @@ func main() {
 	log.Logger = zerolog.New(os.Stdout).With().Timestamp().Caller().Logger()
 
 	// Config
-	cfgPath := os.Getenv("WITNESS_CONFIG")
+	cfgPath := os.Getenv("HUBBLEOPS_CONFIG")
 	if cfgPath == "" {
 		cfgPath = "configs/proxy.yaml"
 	}
@@ -96,7 +96,7 @@ func main() {
 		log.Fatal().Err(err).Msg("failed to load config")
 	}
 
-	walDir := os.Getenv("WITNESS_WAL_DIR")
+	walDir := os.Getenv("HUBBLEOPS_WAL_DIR")
 	if walDir == "" {
 		walDir = "data/wal"
 	}
@@ -105,7 +105,7 @@ func main() {
 	defer cancel()
 
 	// Postgres
-	log.Info().Str("dsn", cfg.Postgres.DSN()).Msg("connecting to postgres")
+	log.Info().Str("dsn", cfg.Postgres.RedactedDSN()).Msg("connecting to postgres")
 	pgPool, err := pgxpool.New(ctx, cfg.Postgres.DSN())
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to connect to postgres")
