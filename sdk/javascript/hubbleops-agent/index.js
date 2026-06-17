@@ -1,22 +1,22 @@
 const crypto = require("crypto");
 
-class WitnessLoopBlocked extends Error {
+class HubbleOpsLoopBlocked extends Error {
   constructor(payload) {
-    super(payload.reason || payload.message || "Witness blocked tool execution");
-    this.name = "WitnessLoopBlocked";
+    super(payload.reason || payload.message || "HubbleOps blocked tool execution");
+    this.name = "HubbleOpsLoopBlocked";
     this.payload = payload;
   }
 }
 
-class WitnessClient {
+class HubbleOpsClient {
   constructor(options = {}) {
-    this.baseUrl = (options.baseUrl || process.env.WITNESS_BASE_URL || process.env.WITNESS_URL || "http://localhost:8080").replace(/\/+$/, "");
-    this.project = options.project || process.env.WITNESS_PROJECT || process.env.WITNESS_PROJECT_KEY || "unknown";
-    this.sessionId = options.sessionId || process.env.WITNESS_SESSION_ID || "";
-    this.timeoutMs = Number(options.timeoutMs || process.env.WITNESS_TIMEOUT_MS || 1000);
-    this.failOpen = options.failOpen !== undefined ? Boolean(options.failOpen) : boolEnv("WITNESS_FAIL_OPEN", true);
-    this.apiKey = options.apiKey || process.env.WITNESS_API_KEY || process.env.WITNESS_PROJECT_KEY || "";
-    this.capture = (options.capture || process.env.WITNESS_CAPTURE_MODE || "fingerprint").toLowerCase();
+    this.baseUrl = (options.baseUrl || process.env.HUBBLEOPS_BASE_URL || process.env.HUBBLEOPS_URL || "http://localhost:8080").replace(/\/+$/, "");
+    this.project = options.project || process.env.HUBBLEOPS_PROJECT || process.env.HUBBLEOPS_PROJECT_KEY || "unknown";
+    this.sessionId = options.sessionId || process.env.HUBBLEOPS_SESSION_ID || "";
+    this.timeoutMs = Number(options.timeoutMs || process.env.HUBBLEOPS_TIMEOUT_MS || 1000);
+    this.failOpen = options.failOpen !== undefined ? Boolean(options.failOpen) : boolEnv("HUBBLEOPS_FAIL_OPEN", true);
+    this.apiKey = options.apiKey || process.env.HUBBLEOPS_API_KEY || process.env.HUBBLEOPS_PROJECT_KEY || "";
+    this.capture = (options.capture || process.env.HUBBLEOPS_CAPTURE_MODE || "fingerprint").toLowerCase();
     this.lastError = null;
   }
 
@@ -40,13 +40,13 @@ class WitnessClient {
       capabilityToken: options.capabilityToken ?? options.capability_token,
       duplicateWindowSeconds: options.duplicateWindowSeconds,
     });
-    return this.post("/v1/tool/check", payload, true);
+    return this.post("/v1/tool/check", payload, true, true);
   }
 
   async checkAction(actionName, args = {}, options = {}) {
     const payload = this.payload(actionName, { ...options, args });
     payload.action_name = actionName;
-    return this.post("/v1/action/check", payload, true);
+    return this.post("/v1/action/check", payload, true, true);
   }
 
   async recordResult(toolName, args = {}, result = null, options = {}) {
@@ -92,8 +92,17 @@ class WitnessClient {
       const effect = resolveEffectOptions(options, toolName, callArgs);
       const check = await this.checkAction(toolName, callArgs, { ...options, ...effect, stepId, idempotencyKey });
       if (check.action === "block") {
-        throw new WitnessLoopBlocked(check);
+        throw new HubbleOpsLoopBlocked(check);
       }
+      if (check.action === "duplicate") {
+        // The action already committed under this idempotency key. Replay the recorded
+        // outcome instead of running the side effect again; do NOT record a result (that
+        // would re-commit the same key).
+        return duplicateReplayResult(check);
+      }
+      // The check that claimed the pending lease hands back an ownership nonce; the
+      // result event must echo it or a failure release will (correctly) be refused.
+      const claimNonce = check.claim_nonce || "";
 
       try {
         const result = await fn(...args);
@@ -102,6 +111,7 @@ class WitnessClient {
           ...effect,
           stepId,
           idempotencyKey,
+          claimNonce,
           stateDeltaHash: hashJSON(result),
         });
         return result;
@@ -111,6 +121,7 @@ class WitnessClient {
           ...effect,
           stepId,
           idempotencyKey,
+          claimNonce,
           resultClass: classifyError(err),
         });
         throw err;
@@ -130,11 +141,11 @@ class WitnessClient {
     const checks = [];
     const health = await this.get("/healthz", false);
     checks.push({ name: "healthz", ok: Boolean(health.ok || health.status === "healthy"), detail: health.reason || "" });
-    const check = await this.checkTool("witness_doctor_noop", { probe: true }, { sessionId: "witness-doctor" });
+    const check = await this.checkTool("hubbleops_doctor_noop", { probe: true }, { sessionId: "hubbleops-doctor" });
     checks.push({ name: "tool_check", ok: check.action === "allow" || check.action === "warn", detail: check.reason || "" });
-    const result = await this.recordResult("witness_doctor_noop", { probe: true }, { ok: true }, {
-      sessionId: "witness-doctor",
-      stateDeltaHash: "witness-doctor-ok",
+    const result = await this.recordResult("hubbleops_doctor_noop", { probe: true }, { ok: true }, {
+      sessionId: "hubbleops-doctor",
+      stateDeltaHash: "hubbleops-doctor-ok",
     });
     checks.push({ name: "tool_result", ok: result.action === "allow" || result.action === "warn", detail: result.reason || "" });
     return { baseUrl: this.baseUrl, ok: checks.every((check) => check.ok), checks };
@@ -172,6 +183,7 @@ class WitnessClient {
     if (allowedDomain) payload.allowed_domain = allowedDomain;
     if (capabilityToken) payload.capability_token = capabilityToken;
     if (options.duplicateWindowSeconds) payload.duplicate_window_seconds = Number(options.duplicateWindowSeconds);
+    if (options.claimNonce) payload.claim_nonce = options.claimNonce;
     if (options.result !== undefined && options.result !== null) {
       payload.result = this.captureValue(options.result);
     }
@@ -186,7 +198,7 @@ class WitnessClient {
       return value;
     }
     return {
-      witness_capture: "fingerprint",
+      hubbleops_capture: "fingerprint",
       sha256: hashJSON(value),
       type: Array.isArray(value) ? "array" : typeof value,
     };
@@ -196,35 +208,42 @@ class WitnessClient {
     return this.send(path, { method: "GET" }, allowFailOpen);
   }
 
-  async post(path, payload, allowFailOpen) {
+  async post(path, payload, allowFailOpen, enforceRisk = false) {
+    // Per-tier fail policy: for a high-stakes action (dangerous / money movement) we
+    // fail CLOSED on the pre-execution check even when the global default is fail-open
+    // — if we can't reach HubbleOps to verify it, we don't let it run.
+    const failClosedBlock = enforceRisk && isHighRisk(payload.action_risk);
     return this.send(path, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Project": payload.project },
       body: JSON.stringify(payload),
-    }, allowFailOpen);
+    }, failClosedBlock ? false : allowFailOpen, failClosedBlock);
   }
 
-  async send(path, init, allowFailOpen) {
+  async send(path, init, allowFailOpen, failClosedBlock = false) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
-      const headers = { "User-Agent": "witness-agent-js/0", ...(init.headers || {}) };
+      const headers = { "User-Agent": "hubbleops-agent-js/0", ...(init.headers || {}) };
       if (this.apiKey) {
-        headers["X-Witness-API-Key"] = this.apiKey;
+        headers["X-HubbleOps-API-Key"] = this.apiKey;
       }
       const res = await fetch(this.baseUrl + path, { ...init, headers, signal: controller.signal });
       const text = await res.text();
       const payload = text ? JSON.parse(text) : { action: "allow" };
-      if (res.status === 429) {
+      // 429 = loop/rate block, 422 = contradictory idempotency replay, 409 = the first
+      // attempt with this idempotency key is still in flight. All three are deliberate
+      // server blocks with a decision body — never fail-open them.
+      if (res.status === 429 || res.status === 422 || res.status === 409) {
         payload.action = payload.action || "block";
-        throw new WitnessLoopBlocked(payload);
+        throw new HubbleOpsLoopBlocked(payload);
       }
       if (!res.ok) {
-        throw new Error(`Witness HTTP ${res.status}: ${text}`);
+        throw new Error(`HubbleOps HTTP ${res.status}: ${text}`);
       }
       return payload;
     } catch (err) {
-      if (err instanceof WitnessLoopBlocked) {
+      if (err instanceof HubbleOpsLoopBlocked) {
         throw err;
       }
       if (allowFailOpen && this.failOpen) {
@@ -232,9 +251,18 @@ class WitnessClient {
         return {
           action: "allow",
           fail_open: true,
-          reason: "Witness unavailable; allowed by fail-open SDK policy",
+          reason: "HubbleOps unavailable; allowed by fail-open SDK policy",
           error: err.name || "Error",
         };
+      }
+      if (failClosedBlock) {
+        this.lastError = err;
+        throw new HubbleOpsLoopBlocked({
+          action: "block",
+          fail_closed: true,
+          reason: "HubbleOps unavailable; high-risk action blocked by fail-closed SDK policy",
+          error: err.name || "Error",
+        });
       }
       throw err;
     } finally {
@@ -244,7 +272,7 @@ class WitnessClient {
 }
 
 function wrapTool(fn, options = {}) {
-  const client = options.client || new WitnessClient(options);
+  const client = options.client || new HubbleOpsClient(options);
   return client.wrapTool(fn, options);
 }
 
@@ -254,6 +282,17 @@ function wrapAction(fn, options = {}) {
 
 function action(fn, options = {}) {
   return wrapAction(fn, options);
+}
+
+function duplicateReplayResult(check) {
+  // Return the recorded outcome of an already-committed action. Raw capture retains the
+  // original result body (Stripe-style idempotent replay); fingerprint capture retains
+  // only metadata, returned with a hubbleopsReplay marker. The action is not run again.
+  const replay = check.replay || {};
+  if (replay.result !== undefined && replay.result !== null) {
+    return replay.result;
+  }
+  return { hubbleopsReplay: true, ...replay };
 }
 
 function resolveIdempotencyKey(value, toolName, callArgs, risk = "read") {
@@ -287,6 +326,12 @@ function resolveOption(value, toolName, callArgs) {
     return value(callArgs, toolName);
   }
   return value;
+}
+
+const HIGH_RISK_LABELS = new Set(["dangerous", "danger", "critical", "destructive", "money_movement"]);
+
+function isHighRisk(risk) {
+  return HIGH_RISK_LABELS.has(String(risk || "").trim().toLowerCase());
 }
 
 function hashJSON(value) {
@@ -334,4 +379,4 @@ function classifyResult(result) {
   return "success";
 }
 
-module.exports = { WitnessClient, WitnessLoopBlocked, wrapTool, wrapAction, action };
+module.exports = { HubbleOpsClient, HubbleOpsLoopBlocked, wrapTool, wrapAction, action };

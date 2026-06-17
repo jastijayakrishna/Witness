@@ -3,13 +3,13 @@ requires = ["hatchling>=1.25"]
 build-backend = "hatchling.build"
 
 [project]
-name = "witness-agent"
+name = "hubbleops-agent"
 version = "0.0.0"
-description = "Fail-open Witness action firewall SDK for Python agents"
+description = "Fail-open HubbleOps action firewall SDK for Python agents"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
-authors = [{ name = "Witness" }]
+authors = [{ name = "HubbleOps" }]
 keywords = ["ai", "agents", "safety", "idempotency", "audit"]
 classifiers = [
   "Development Status :: 3 - Alpha",
@@ -20,7 +20,7 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/witness-proxy/witness-proxy"
+Homepage = "https://github.com/hubbleops/hubbleops"
 
 [tool.hatch.build.targets.wheel]
-packages = ["witness_agent"]
+packages = ["hubbleops_agent"]

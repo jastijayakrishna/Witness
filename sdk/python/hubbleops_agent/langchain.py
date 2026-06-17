@@ -9,14 +9,14 @@ import urllib.error
 import urllib.request
 
 
-class WitnessLoopBlocked(RuntimeError):
+class HubbleOpsLoopBlocked(RuntimeError):
     def __init__(self, payload):
         self.payload = payload
-        error = payload.get("reason") or payload.get("message") or "Witness blocked tool execution"
+        error = payload.get("reason") or payload.get("message") or "HubbleOps blocked tool execution"
         super().__init__(error)
 
 
-class WitnessClient:
+class HubbleOpsClient:
     def __init__(
         self,
         base_url=None,
@@ -27,13 +27,13 @@ class WitnessClient:
         api_key=None,
         capture=None,
     ):
-        self.base_url = (base_url or os.getenv("WITNESS_BASE_URL") or os.getenv("WITNESS_URL") or "http://localhost:8080").rstrip("/")
-        self.project = project or os.getenv("WITNESS_PROJECT") or os.getenv("WITNESS_PROJECT_KEY")
-        self.session_id = session_id or os.getenv("WITNESS_SESSION_ID")
-        self.timeout = _float_env("WITNESS_TIMEOUT_SECONDS", timeout, 1.0)
-        self.fail_open = _bool_env("WITNESS_FAIL_OPEN", fail_open, True)
-        self.api_key = api_key or os.getenv("WITNESS_API_KEY") or os.getenv("WITNESS_PROJECT_KEY")
-        self.capture = (capture or os.getenv("WITNESS_CAPTURE_MODE") or "fingerprint").lower()
+        self.base_url = (base_url or os.getenv("HUBBLEOPS_BASE_URL") or os.getenv("HUBBLEOPS_URL") or "http://localhost:8080").rstrip("/")
+        self.project = project or os.getenv("HUBBLEOPS_PROJECT") or os.getenv("HUBBLEOPS_PROJECT_KEY")
+        self.session_id = session_id or os.getenv("HUBBLEOPS_SESSION_ID")
+        self.timeout = _float_env("HUBBLEOPS_TIMEOUT_SECONDS", timeout, 1.0)
+        self.fail_open = _bool_env("HUBBLEOPS_FAIL_OPEN", fail_open, True)
+        self.api_key = api_key or os.getenv("HUBBLEOPS_API_KEY") or os.getenv("HUBBLEOPS_PROJECT_KEY")
+        self.capture = (capture or os.getenv("HUBBLEOPS_CAPTURE_MODE") or "fingerprint").lower()
         self.last_error = None
 
     def check_tool(
@@ -78,12 +78,12 @@ class WitnessClient:
             capability_token=capability_token,
             duplicate_window_seconds=duplicate_window_seconds,
         )
-        return self._post("/v1/tool/check", payload, allow_fail_open=True)
+        return self._post("/v1/tool/check", payload, allow_fail_open=True, enforce_risk=True)
 
     def check_action(self, action_name, args=None, **kwargs):
         payload = self._payload(action_name, args=args, **kwargs)
         payload["action_name"] = action_name
-        return self._post("/v1/action/check", payload, allow_fail_open=True)
+        return self._post("/v1/action/check", payload, allow_fail_open=True, enforce_risk=True)
 
     def record_result(
         self,
@@ -111,6 +111,7 @@ class WitnessClient:
         allowed_domain=None,
         capability_token=None,
         duplicate_window_seconds=None,
+        claim_nonce=None,
     ):
         payload = self._payload(
             tool_name,
@@ -136,6 +137,7 @@ class WitnessClient:
             allowed_domain=allowed_domain,
             capability_token=capability_token,
             duplicate_window_seconds=duplicate_window_seconds,
+            claim_nonce=claim_nonce,
         )
         return self._post("/v1/tool/result", payload, allow_fail_open=True)
 
@@ -219,7 +221,15 @@ class WitnessClient:
                     **effect,
                 )
                 if check.get("action") == "block":
-                    raise WitnessLoopBlocked(check)
+                    raise HubbleOpsLoopBlocked(check)
+                if check.get("action") == "duplicate":
+                    # The action already committed under this idempotency key. Replay the
+                    # recorded outcome instead of running the side effect a second time;
+                    # do NOT record a result (that would re-commit the same key).
+                    return _duplicate_replay_result(check)
+                # Echo the lease-ownership nonce on the result event; a failure release
+                # without it is (correctly) refused by the ledger.
+                claim_nonce = check.get("claim_nonce") or None
 
                 try:
                     result = await fn(*args, **kwargs)
@@ -237,6 +247,7 @@ class WitnessClient:
                         agent_id=agent_id,
                         user_id=user_id,
                         duplicate_window_seconds=duplicate_window_seconds,
+                        claim_nonce=claim_nonce,
                         **effect,
                     )
                     raise
@@ -254,6 +265,7 @@ class WitnessClient:
                     agent_id=agent_id,
                     user_id=user_id,
                     duplicate_window_seconds=duplicate_window_seconds,
+                    claim_nonce=claim_nonce,
                     **effect,
                 )
                 return result
@@ -290,7 +302,15 @@ class WitnessClient:
                 **effect,
             )
             if check.get("action") == "block":
-                raise WitnessLoopBlocked(check)
+                raise HubbleOpsLoopBlocked(check)
+            if check.get("action") == "duplicate":
+                # The action already committed under this idempotency key. Replay the
+                # recorded outcome instead of running the side effect a second time;
+                # do NOT record a result (that would re-commit the same key).
+                return _duplicate_replay_result(check)
+            # Echo the lease-ownership nonce on the result event; a failure release
+            # without it is (correctly) refused by the ledger.
+            claim_nonce = check.get("claim_nonce") or None
 
             try:
                 result = fn(*args, **kwargs)
@@ -308,6 +328,7 @@ class WitnessClient:
                     agent_id=agent_id,
                     user_id=user_id,
                     duplicate_window_seconds=duplicate_window_seconds,
+                    claim_nonce=claim_nonce,
                     **effect,
                 )
                 raise
@@ -325,6 +346,7 @@ class WitnessClient:
                 agent_id=agent_id,
                 user_id=user_id,
                 duplicate_window_seconds=duplicate_window_seconds,
+                claim_nonce=claim_nonce,
                 **effect,
             )
             return result
@@ -345,14 +367,14 @@ class WitnessClient:
             "ok": bool(health.get("ok") or health.get("status") == "healthy"),
             "detail": health.get("reason", ""),
         })
-        check = self.check_tool("witness_doctor_noop", {"probe": True}, session_id="witness-doctor")
+        check = self.check_tool("hubbleops_doctor_noop", {"probe": True}, session_id="hubbleops-doctor")
         report["checks"].append({"name": "tool_check", "ok": check.get("action") in ("allow", "warn"), "detail": check.get("reason", "")})
         result = self.record_result(
-            "witness_doctor_noop",
+            "hubbleops_doctor_noop",
             {"probe": True},
             {"ok": True},
-            session_id="witness-doctor",
-            state_delta_hash="witness-doctor-ok",
+            session_id="hubbleops-doctor",
+            state_delta_hash="hubbleops-doctor-ok",
         )
         report["checks"].append({"name": "tool_result", "ok": result.get("action") in ("allow", "warn"), "detail": result.get("reason", "")})
         report["ok"] = all(check["ok"] for check in report["checks"])
@@ -384,6 +406,7 @@ class WitnessClient:
         allowed_domain=None,
         capability_token=None,
         duplicate_window_seconds=None,
+        claim_nonce=None,
     ):
         raw_args = args if args is not None else {}
         payload = {
@@ -423,6 +446,8 @@ class WitnessClient:
             payload["capability_token"] = capability_token
         if duplicate_window_seconds:
             payload["duplicate_window_seconds"] = int(duplicate_window_seconds)
+        if claim_nonce:
+            payload["claim_nonce"] = claim_nonce
         if result is not None:
             payload["result"] = self._capture_value(result)
         if result_class:
@@ -433,7 +458,7 @@ class WitnessClient:
         if self.capture == "raw":
             return value
         return {
-            "witness_capture": "fingerprint",
+            "hubbleops_capture": "fingerprint",
             "sha256": _hash_json(value),
             "type": type(value).__name__,
         }
@@ -442,7 +467,13 @@ class WitnessClient:
         req = urllib.request.Request(self.base_url + path, headers=self._headers(), method="GET")
         return self._send(req, allow_fail_open=allow_fail_open)
 
-    def _post(self, path, payload, *, allow_fail_open):
+    def _post(self, path, payload, *, allow_fail_open, enforce_risk=False):
+        # Per-tier fail policy: for a high-stakes action (dangerous / money movement)
+        # we fail CLOSED on the pre-execution check even when the global default is
+        # fail-open — if we can't reach HubbleOps to verify it, we don't let it run.
+        fail_closed_block = enforce_risk and _is_high_risk(payload.get("action_risk"))
+        if fail_closed_block:
+            allow_fail_open = False
         body = json.dumps(payload, separators=(",", ":"), sort_keys=True, default=str).encode("utf-8")
         req = urllib.request.Request(
             self.base_url + path,
@@ -450,9 +481,9 @@ class WitnessClient:
             headers={**self._headers(), "Content-Type": "application/json", "X-Project": payload.get("project", "unknown")},
             method="POST",
         )
-        return self._send(req, allow_fail_open=allow_fail_open)
+        return self._send(req, allow_fail_open=allow_fail_open, fail_closed_block=fail_closed_block)
 
-    def _send(self, req, *, allow_fail_open):
+    def _send(self, req, *, allow_fail_open, fail_closed_block=False):
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 data = resp.read().decode("utf-8")
@@ -465,15 +496,22 @@ class WitnessClient:
                 payload = json.loads(data)
             except json.JSONDecodeError:
                 payload = {"action": "block", "reason": data}
-            if exc.code == 429:
+            # 429 = loop/rate block, 422 = contradictory idempotency replay, 409 = the
+            # first attempt with this idempotency key is still in flight. All three are
+            # deliberate server blocks with a decision body — never fail-open them.
+            if exc.code in (429, 422, 409):
                 payload.setdefault("action", "block")
-                raise WitnessLoopBlocked(payload)
+                raise HubbleOpsLoopBlocked(payload)
             if allow_fail_open and self.fail_open:
                 return self._fail_open(exc)
+            if fail_closed_block:
+                raise HubbleOpsLoopBlocked(self._fail_closed_payload(exc))
             raise
         except (urllib.error.URLError, TimeoutError, socket.timeout, json.JSONDecodeError, OSError) as exc:
             if allow_fail_open and self.fail_open:
                 return self._fail_open(exc)
+            if fail_closed_block:
+                raise HubbleOpsLoopBlocked(self._fail_closed_payload(exc))
             raise
 
     def _fail_open(self, exc):
@@ -481,14 +519,23 @@ class WitnessClient:
         return {
             "action": "allow",
             "fail_open": True,
-            "reason": "Witness unavailable; allowed by fail-open SDK policy",
+            "reason": "HubbleOps unavailable; allowed by fail-open SDK policy",
+            "error": exc.__class__.__name__,
+        }
+
+    def _fail_closed_payload(self, exc):
+        self.last_error = exc
+        return {
+            "action": "block",
+            "fail_closed": True,
+            "reason": "HubbleOps unavailable; high-risk action blocked by fail-closed SDK policy",
             "error": exc.__class__.__name__,
         }
 
     def _headers(self):
-        headers = {"User-Agent": "witness-agent-python/0"}
+        headers = {"User-Agent": "hubbleops-agent-python/0"}
         if self.api_key:
-            headers["X-Witness-API-Key"] = self.api_key
+            headers["X-HubbleOps-API-Key"] = self.api_key
         return headers
 
 
@@ -514,7 +561,7 @@ def wrap_tool(fn=None, **kwargs):
     ):
         if key in kwargs:
             tool_options[key] = kwargs.pop(key)
-    client = client or WitnessClient(**kwargs)
+    client = client or HubbleOpsClient(**kwargs)
     return client.wrap_tool(fn, **tool_options)
 
 
@@ -524,6 +571,20 @@ def wrap_action(fn=None, **kwargs):
 
 def action(fn=None, **kwargs):
     return wrap_action(fn, **kwargs)
+
+
+def _duplicate_replay_result(check):
+    """Return the recorded outcome of an already-committed action.
+
+    When raw capture retained the original result body, that body is returned verbatim
+    so a well-behaved retry is none the wiser (Stripe-style idempotent replay). In
+    fingerprint capture mode no body was retained, so the recorded outcome metadata is
+    returned with a ``hubbleops_replay`` marker — the action is still NOT executed again.
+    """
+    replay = check.get("replay") or {}
+    if replay.get("result") is not None:
+        return replay["result"]
+    return {"hubbleops_replay": True, **replay}
 
 
 def _step_id(tool_name, payload):
@@ -556,6 +617,13 @@ def _resolve_option(value, tool_name, call_args):
         except TypeError:
             return value(tool_name, call_args)
     return value
+
+
+_HIGH_RISK_LABELS = frozenset({"dangerous", "danger", "critical", "destructive", "money_movement"})
+
+
+def _is_high_risk(risk):
+    return str(risk or "").strip().lower() in _HIGH_RISK_LABELS
 
 
 def _hash_json(value):

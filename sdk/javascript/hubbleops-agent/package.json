@@ -1,7 +1,7 @@
 {
-  "name": "@witness/agent",
+  "name": "@hubbleops/agent",
   "version": "0.0.0",
-  "description": "Fail-open Witness action firewall SDK for JavaScript agents",
+  "description": "Fail-open HubbleOps action firewall SDK for JavaScript agents",
   "main": "index.js",
   "exports": {
     ".": "./index.js"
