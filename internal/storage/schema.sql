@@ -1,4 +1,4 @@
--- Witness Proxy Schema
+-- HubbleOps Proxy Schema
 -- Phase 0: Table definitions (empty, no triggers or functions)
 
 CREATE TABLE IF NOT EXISTS projects (
@@ -17,6 +17,8 @@ CREATE TABLE IF NOT EXISTS api_keys (
     project_id      BIGINT NOT NULL REFERENCES projects(id),
     key_hash        TEXT NOT NULL UNIQUE,
     label           TEXT NOT NULL DEFAULT '',
+    disabled_at     TIMESTAMPTZ,
+    expires_at      TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -64,6 +66,10 @@ CREATE TABLE IF NOT EXISTS action_ledger (
     expires_at      TIMESTAMPTZ NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_action_ledger_expires_at ON action_ledger (expires_at);
+-- action-firewall/3: two-phase claim. 'pending' rows hold a short lease while a side
+-- effect runs; 'committed' rows hold the full duplicate window. Rows created under the
+-- pre-/3 single-phase protocol were full-window claims, so they default to 'committed'.
+ALTER TABLE action_ledger ADD COLUMN IF NOT EXISTS state TEXT NOT NULL DEFAULT 'committed';
 
 -- Phase 2: WAL records table (drained from WAL files)
 CREATE TABLE IF NOT EXISTS wal_records (
@@ -118,6 +124,11 @@ CREATE TABLE IF NOT EXISTS wal_records (
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_prompts_project_hash ON prompts (project_id, prompt_hash);
 CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys (key_hash);
+CREATE INDEX IF NOT EXISTS idx_api_keys_project ON api_keys (project_id);
+
+-- API key lifecycle columns for production auth.
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS disabled_at TIMESTAMPTZ;
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS expires_at  TIMESTAMPTZ;
 
 -- Migration: add Phase 1-3 columns if they don't exist (for tables created before these were added)
 ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS ulid                TEXT NOT NULL DEFAULT '';
