@@ -711,8 +711,8 @@ func Test_EDGE_DetectorVersionStamped(t *testing.T) {
 		Args: map[string]any{"x": 1}, Result: map[string]any{"y": 1},
 		PromptTokens: 100, OutputTokens: 50, CostUSD: 0.01, UnixMillis: 0,
 	}})
-	if d.DetectorVersion != "2.2.0" {
-		t.Fatalf("BUG: DetectorVersion=%q expected 2.2.0", d.DetectorVersion)
+	if d.DetectorVersion != DetectorVersion {
+		t.Fatalf("BUG: DetectorVersion=%q expected %q", d.DetectorVersion, DetectorVersion)
 	}
 }
 
@@ -865,9 +865,9 @@ func Test_EDGE_HighFrequency500Calls(t *testing.T) {
 		}
 	}
 
-	// History should be bounded at ring buffer cap (32)
-	if s.CallHistory.len > 32 {
-		t.Fatalf("BUG: CallHistory grew to %d (cap is 32)", s.CallHistory.len)
+	// History should be bounded at the ring buffer cap
+	if s.CallHistory.len > historyCap {
+		t.Fatalf("BUG: CallHistory grew to %d (cap is %d)", s.CallHistory.len, historyCap)
 	}
 	if s.ContextSizes.len > 32 {
 		t.Fatalf("BUG: ContextSizes grew to %d (cap is 32)", s.ContextSizes.len)
@@ -1211,8 +1211,8 @@ func Test_EDGE_RingBufferWrap(t *testing.T) {
 		s, _ = Observe(s, o, cfg)
 	}
 
-	if s.CallHistory.len != 32 {
-		t.Fatalf("BUG: CallHistory.len=%d, want 32 after 100 pushes", s.CallHistory.len)
+	if s.CallHistory.len != historyCap {
+		t.Fatalf("BUG: CallHistory.len=%d, want %d after 100 pushes", s.CallHistory.len, historyCap)
 	}
 	if s.ContextSizes.len != 32 {
 		t.Fatalf("BUG: ContextSizes.len=%d, want 32 after 100 pushes", s.ContextSizes.len)
