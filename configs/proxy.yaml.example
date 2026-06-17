@@ -1,3 +1,5 @@
+environment: "prod"
+
 server:
   host: "0.0.0.0"
   port: 8080
@@ -5,9 +7,9 @@ server:
 postgres:
   host: "postgres"
   port: 5432
-  user: "witness"
-  password: "witness"
-  dbname: "witness"
+  user: "hubbleops"
+  password: "hubbleops"
+  dbname: "hubbleops"
   sslmode: "disable"
 
 redis:
@@ -20,6 +22,28 @@ wal:
   dir: "data/wal"
   sync_mode: "batch"  # "batch" (default, ~100ms durability window) or "sync" (fsync per write)
 
+auth:
+  enabled: true              # production default: require X-HubbleOps-API-Key
+  dev_auth_bypass: false     # honored only when environment is "dev"
+  metrics_public: false      # /metrics is protected by default
+
+capture:
+  mode: "fingerprint"        # fingerprint by default; raw is local/debug only
+  allow_raw_in_prod: false   # explicit unsafe override for break-glass debugging
+  allow_raw_in_prod_note: "" # operator reason when raw prod capture is enabled
+
+outcome_capture:
+  enabled: true              # writes privacy-safe reviewed-decision candidates
+  mode: "fingerprint"        # data moat MVP stores fingerprints/classes only
+  raw: false                 # production must remain false
+
+reviews:
+  raw_notes: false           # default stores notes_fingerprint only
+
+receipts:
+  require_receipt_for_block: true   # fail open instead of enforcing unaudited blocks
+  enforce_without_receipt: false    # emergency override; logs critical warning
+
 loop_detection:
   enabled: true
   action: "shadow"             # "shadow" (default) → "warn" → "block". Promote after shadow report looks right.
@@ -29,3 +53,39 @@ loop_detection:
   warn_confidence: 0.40
   block_confidence: 0.70
   require_session_for_block: true
+  # Per-tool minimum risk class the client cannot downgrade. The client may raise
+  # the risk but never lower it below the floor you classify here, so a side-effect
+  # tool sent with action_risk:"read" still engages the idempotency/dedup firewall.
+  # Unknown tools fall back to the client-supplied label. Use "dangerous" for tools
+  # that should also fail CLOSED (block) during a ledger/WAL outage.
+  tool_risk_floors:
+    # refund_customer: "write"
+    # delete_resource: "dangerous"
+    # send_email: "write"
+
+# Resource limits: protections that apply ACROSS actions, scoped to the
+# authenticated agent key (the server-derived identity a client cannot rotate
+# away). Everything here is operator-declared; clients cannot tune limits.
+# Windows are fixed buckets: a burst straddling a boundary can briefly reach
+# ~2x a cap. Limits count ATTEMPTS at decide time (conservative).
+limits:
+  # Windowed spend caps. Catches "many small refunds under the per-action cap".
+  cumulative:
+    # - name: refunds-per-agent-hour
+    #   tool: refund_customer      # omit to match any tool with amount_cents
+    #   scope: agent               # agent | session | resource | recipient
+    #   window_seconds: 3600
+    #   max_amount_cents: 10000
+  # Windowed counts of side-effecting actions. Catches retry storms and sprays
+  # even when the agent rotates sessions.
+  velocity:
+    # - name: money-moves-per-minute
+    #   min_risk: write            # write (default) | dangerous
+    #   scope: agent
+    #   window_seconds: 60
+    #   max_actions: 10
+  # Repeated enforced blocks quarantine the agent's fail-closed-risk actions.
+  breaker:
+    trips: 0                       # 0 = disabled; e.g. 5 blocks ...
+    window_seconds: 600            # ... within 10 minutes ...
+    cooldown_seconds: 900          # ... holds money/dangerous actions for 15m
