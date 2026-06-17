@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/witness-proxy/witness-proxy/internal/loop"
+	"github.com/hubbleops/hubbleops/internal/loop"
 )
 
 const (
@@ -18,8 +18,17 @@ const (
 // TestSyntheticCorpusScoreboard replays the full starter corpus through the real
 // detector + firewall and enforces the world-class bar per family. Misses are
 // written to out/scoreboard_misses.jsonl for triage — fix the product, not the test.
+//
+// HUBBLEOPS_CORPUS_DIR overrides the corpus location so held-out seeds (data the
+// thresholds were never tuned on) can be scored with the same gate:
+//
+//	python synthgen.py --out out/heldout8 --sessions 10000 --seed 8
+//	HUBBLEOPS_CORPUS_DIR=out/heldout8/corpus go test ./internal/synthcorpus/ -run TestSyntheticCorpusScoreboard -v
 func TestSyntheticCorpusScoreboard(t *testing.T) {
 	dir := filepath.Join("..", "..", "starter_corpus_3000", "corpus")
+	if override := os.Getenv("HUBBLEOPS_CORPUS_DIR"); override != "" {
+		dir = filepath.Join("..", "..", override)
+	}
 	events, err := ReadDir(dir)
 	if err != nil {
 		t.Fatalf("read corpus: %v", err)

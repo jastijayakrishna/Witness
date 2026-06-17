@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"sort"
 
-	"github.com/witness-proxy/witness-proxy/internal/loop"
+	"github.com/hubbleops/hubbleops/internal/loop"
 )
 
 // SessionResult is the scored outcome of replaying one session.
@@ -82,6 +82,7 @@ func ReplaySession(ctx context.Context, events []Event, cfg loop.Config, store *
 
 		// ---- pre_tool: action firewall (idempotency, amount, backup, recipient). ----
 		risk := effectiveRisk(ev)
+		claimNonce := ""
 		if store != nil {
 			ad, err := store.Decide(ctx, loop.ActionObservation{
 				Project:                ev.Project,
@@ -89,6 +90,7 @@ func ReplaySession(ctx context.Context, events []Event, cfg loop.Config, store *
 				StepID:                 ev.StepID,
 				ToolName:               ev.ToolName,
 				ActionRisk:             risk,
+				RawActionRisk:          ev.ActionRisk,
 				IdempotencyKey:         ev.IdempotencyKey,
 				AgentID:                ev.AgentID,
 				UserID:                 ev.UserID,
@@ -106,6 +108,9 @@ func ReplaySession(ctx context.Context, events []Event, cfg loop.Config, store *
 				return res, err
 			}
 			record(ad.Decision, i)
+			// A well-behaved SDK echoes the claim nonce back on the result event so the
+			// release path can prove it owns the pending lease.
+			claimNonce = ad.ClaimNonce
 		}
 
 		// ---- post_tool: observe the result; same class fallback as the proxy. ----
@@ -128,12 +133,13 @@ func ReplaySession(ctx context.Context, events []Event, cfg loop.Config, store *
 			OutputTokens:   ev.OutputTokens,
 			CostUSD:        ev.CostUSD,
 			UnixMillis:     ev.UnixMillis,
+			IdempotencyKey: ev.IdempotencyKey,
 		}, cfg)
 		record(post, i)
 
 		// ---- reconcile the pending claim like the proxy result path. ----
 		if store != nil && ev.IdempotencyKey != "" && risk != loop.ActionRiskRead {
-			switch loop.ResultClassDisposition(resultClass) {
+			switch loop.ResultDisposition(resultClass, ev.ActionRisk, risk) {
 			case loop.ActionDispositionCommit:
 				raw, _ := json.Marshal(ev.Result)
 				if err := store.Commit(ctx, loop.ActionResult{
@@ -141,6 +147,7 @@ func ReplaySession(ctx context.Context, events []Event, cfg loop.Config, store *
 					IdempotencyKey:         ev.IdempotencyKey,
 					ToolName:               ev.ToolName,
 					ActionRisk:             risk,
+					RawActionRisk:          ev.ActionRisk,
 					ResourceID:             ev.ResourceID,
 					AmountCents:            ev.AmountCents,
 					Recipient:              ev.Recipient,
@@ -152,7 +159,7 @@ func ReplaySession(ctx context.Context, events []Event, cfg loop.Config, store *
 					return res, err
 				}
 			case loop.ActionDispositionRelease:
-				if err := store.Release(ctx, ev.Project, ev.IdempotencyKey); err != nil {
+				if err := store.Release(ctx, ev.Project, ev.IdempotencyKey, claimNonce); err != nil {
 					return res, err
 				}
 			}
