@@ -6,7 +6,44 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/hubbleops/hubbleops/internal/auth"
 )
+
+// BindSession scopes the client-supplied session under the authenticated key identity.
+// Without this, the session header is the unit of detector state, and a rogue agent can
+// shed its loop history by rotating the header — or collide with another agent's state
+// by reusing one.
+func TestBindSession_NamespacesUnderKeyIdentity(t *testing.T) {
+	r, _ := http.NewRequest("POST", "/v1/tool/check", nil)
+	r = r.WithContext(auth.WithIdentity(r.Context(), "proj-a", "abcd1234abcd1234"))
+
+	if got := BindSession(r, "sess-1"); got != "key:abcd1234abcd1234:sess-1" {
+		t.Fatalf("bound session=%q want key:abcd1234abcd1234:sess-1", got)
+	}
+}
+
+// An authenticated caller that omits the session entirely must still get a non-empty
+// session derived from its key: an empty session downgrades blocks to warns
+// (RequireSessionForBlock), which would let an agent dodge enforcement by omission.
+func TestBindSession_AuthenticatedEmptySessionFallsBackToKey(t *testing.T) {
+	r, _ := http.NewRequest("POST", "/v1/tool/check", nil)
+	r = r.WithContext(auth.WithIdentity(r.Context(), "proj-a", "abcd1234abcd1234"))
+
+	if got := BindSession(r, ""); got != "key:abcd1234abcd1234" {
+		t.Fatalf("bound session=%q want key:abcd1234abcd1234", got)
+	}
+}
+
+func TestBindSession_PassthroughWithoutAuthenticatedIdentity(t *testing.T) {
+	r, _ := http.NewRequest("POST", "/v1/tool/check", nil)
+	if got := BindSession(r, "sess-1"); got != "sess-1" {
+		t.Fatalf("unauthenticated session=%q want sess-1", got)
+	}
+	if got := BindSession(r, ""); got != "" {
+		t.Fatalf("unauthenticated empty session=%q want empty", got)
+	}
+}
 
 func TestResolveProject_XProjectHeader(t *testing.T) {
 	r, _ := http.NewRequest("POST", "/openai/v1/chat/completions", nil)
