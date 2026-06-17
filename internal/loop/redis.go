@@ -67,6 +67,53 @@ func (ss *StateStore) Save(ctx context.Context, project, sessionID string, s Sta
 // maxTransactRetries limits optimistic lock retries to bound latency.
 const maxTransactRetries = 3
 
+func projectGuardStateKey(project string) string {
+	return fmt.Sprintf("loopproj:%s", project)
+}
+
+// TransactProject atomically loads the project-scope guard state, applies fn,
+// and saves the result — same WATCH/MULTI optimistic concurrency as Transact.
+// Key: loopproj:{project}, TTL 10 minutes (the guard window is shorter).
+func (ss *StateStore) TransactProject(ctx context.Context, project string, fn func(ProjectState) ProjectState) (ProjectState, error) {
+	key := projectGuardStateKey(project)
+	var result ProjectState
+
+	for attempt := 0; attempt < maxTransactRetries; attempt++ {
+		err := ss.rdb.Watch(ctx, func(tx *redis.Tx) error {
+			data, err := tx.Get(ctx, key).Bytes()
+			var state ProjectState
+			if err == redis.Nil {
+				state = NewProjectState()
+			} else if err != nil {
+				return fmt.Errorf("redis get project guard: %w", err)
+			} else if err := json.Unmarshal(data, &state); err != nil {
+				state = NewProjectState() // corrupted state — reset
+			}
+
+			result = fn(state)
+
+			newData, err := json.Marshal(result)
+			if err != nil {
+				return fmt.Errorf("marshal project guard: %w", err)
+			}
+			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+				pipe.Set(ctx, key, newData, stateTTL)
+				return nil
+			})
+			return err
+		}, key)
+
+		if err == nil {
+			return result, nil
+		}
+		if err == redis.TxFailedErr {
+			continue
+		}
+		return result, fmt.Errorf("redis transact project guard: %w", err)
+	}
+	return result, fmt.Errorf("redis transact project guard: max retries (%d) exceeded", maxTransactRetries)
+}
+
 // Transact atomically loads state, applies fn, and saves the result.
 // Uses Redis WATCH/MULTI for optimistic concurrency — if another request
 // modifies the same key between our GET and SET, the transaction is retried
