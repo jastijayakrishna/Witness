@@ -52,11 +52,17 @@ wal-offset.json
 .env*
 !.env.example
 
+# Agentlab run logs (disposable stress-harness output)
+/agentlab/*.log
+
 # Planning docs (not part of shipped product)
 implementation.txt
 plan.md
 CURRENT_STATUS.md
 WHAT_WE_BUILT.txt
+SAFETY_GRAPH_IMPLEMENTATION_PLAN.txt
+REPO_EXPLAINED.txt
+/docs/superpowers/
 CLAUDE.md
 AGENTS.md
 
