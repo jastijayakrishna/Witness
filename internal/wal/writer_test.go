@@ -357,6 +357,29 @@ func TestWriter_SyncMode_Sync(t *testing.T) {
 	}
 }
 
+func TestWriter_CheckWritableDoesNotAppendRecord(t *testing.T) {
+	dir := tempDir(t)
+	w, err := NewWriter(dir, "sync")
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	defer w.Close()
+
+	if err := w.CheckWritable(); err != nil {
+		t.Fatalf("CheckWritable: %v", err)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "wal-") && strings.HasSuffix(entry.Name(), ".jsonl") {
+			t.Fatalf("CheckWritable created WAL record file %s", entry.Name())
+		}
+	}
+}
+
 // TestWriter_SyncMode_Default verifies that empty or unknown sync mode
 // defaults to batch mode behavior.
 func TestWriter_SyncMode_Default(t *testing.T) {

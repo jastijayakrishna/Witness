@@ -92,28 +92,30 @@ type Record struct {
 	// v5.2 moat hooks — cheap now, impossible to retrofit later.
 	// Every record carries these from day 1 so replay, training, and
 	// auditing pipelines can always reconstruct who decided what and why.
-	TrajectoryID     string `json:"trajectory_id,omitempty"`     // UUID per session — groups a run into one trajectory
-	DetectorVersion  string `json:"detector_version,omitempty"`  // loop.DetectorVersion — which algo made this call
-	Framework        string `json:"framework,omitempty"`         // detected agent framework (langchain/crewai/unknown)
-	NearMiss         bool   `json:"near_miss,omitempty"`         // confidence 0.50–0.69 — valuable training signal
-	ImmediateOutcome string `json:"immediate_outcome,omitempty"` // success/blocked/error — set by handler
-	DecisionID       string `json:"decision_id,omitempty"`
-	AgentID          string `json:"agent_id,omitempty"`
-	UserID           string `json:"user_id,omitempty"`
-	ActionRisk       string `json:"action_risk,omitempty"`
-	IdempotencyKey   string `json:"idempotency_key,omitempty"`
-	ResourceID       string `json:"resource_id,omitempty"`
-	AmountCents      int64  `json:"amount_cents,omitempty"`
-	MaxAmountCents   int64  `json:"max_amount_cents,omitempty"`
-	BackupID         string `json:"backup_id,omitempty"`
-	RecipientDomain  string `json:"recipient_domain,omitempty"`
-	AllowedDomain    string `json:"allowed_domain,omitempty"`
-	CapabilityHash   string `json:"capability_hash,omitempty"`
-	PolicyVersion    string `json:"policy_version,omitempty"`
-	DecisionReason   string `json:"decision_reason,omitempty"`
-	DecisionEvidence string `json:"decision_evidence,omitempty"`
-	ReceiptSignature string `json:"receipt_signature,omitempty"`
-	ReceiptKeyID     string `json:"receipt_key_id,omitempty"`
+	TrajectoryID        string `json:"trajectory_id,omitempty"`     // UUID per session — groups a run into one trajectory
+	DetectorVersion     string `json:"detector_version,omitempty"`  // loop.DetectorVersion — which algo made this call
+	Framework           string `json:"framework,omitempty"`         // detected agent framework (langchain/crewai/unknown)
+	NearMiss            bool   `json:"near_miss,omitempty"`         // confidence 0.50–0.69 — valuable training signal
+	ImmediateOutcome    string `json:"immediate_outcome,omitempty"` // success/blocked/error — set by handler
+	DecisionID          string `json:"decision_id,omitempty"`
+	AgentID             string `json:"agent_id,omitempty"`
+	UserID              string `json:"user_id,omitempty"`
+	ActionRisk          string `json:"action_risk,omitempty"`
+	IdempotencyKey      string `json:"idempotency_key,omitempty"` // legacy read path only; new writes use IdempotencyKeyHash
+	IdempotencyKeyHash  string `json:"idempotency_key_hash,omitempty"`
+	ResourceID          string `json:"resource_id,omitempty"` // legacy read path only; new writes use ResourceFingerprint
+	ResourceFingerprint string `json:"resource_fingerprint,omitempty"`
+	AmountCents         int64  `json:"amount_cents,omitempty"`
+	MaxAmountCents      int64  `json:"max_amount_cents,omitempty"`
+	BackupID            string `json:"backup_id,omitempty"`
+	RecipientDomain     string `json:"recipient_domain,omitempty"`
+	AllowedDomain       string `json:"allowed_domain,omitempty"`
+	CapabilityHash      string `json:"capability_hash,omitempty"`
+	PolicyVersion       string `json:"policy_version,omitempty"`
+	DecisionReason      string `json:"decision_reason,omitempty"`
+	DecisionEvidence    string `json:"decision_evidence,omitempty"`
+	ReceiptSignature    string `json:"receipt_signature,omitempty"`
+	ReceiptKeyID        string `json:"receipt_key_id,omitempty"`
 }
 
 // SyncMode constants for WAL writer fsync behavior.
@@ -222,8 +224,28 @@ func NewWriter(dir string, syncMode string) (*Writer, error) {
 // Phase 2: Computes hash chain before writing.
 // If a crash gap was detected on init, emits a chain restart marker first.
 func (w *Writer) Write(rec Record) error {
-	rec.ID = newULID()
 	rec.Time = time.Now().UTC()
+	return w.appendRecord(rec)
+}
+
+// WriteRecovered appends a record that was previously persisted to the dead-letter
+// queue after a failed write. Unlike Write it preserves the record's original
+// decision Time (so the durable audit reflects when the decision was made, not when
+// the WAL recovered) while still assigning a fresh ID and re-chaining the record at
+// its real position in the log.
+func (w *Writer) WriteRecovered(rec Record) error {
+	if rec.Time.IsZero() {
+		rec.Time = time.Now().UTC()
+	}
+	return w.appendRecord(rec)
+}
+
+func (w *Writer) appendRecord(rec Record) error {
+	rec.ID = newULID()
+	// Drop any stale chain fields carried in from a recovered record; the chain is
+	// recomputed below against this writer's current head.
+	rec.PrevHash = ""
+	rec.RecordHash = ""
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -317,6 +339,44 @@ func (w *Writer) Close() error {
 		}
 	})
 	return err
+}
+
+// CheckWritable verifies the WAL directory can still accept durable writes
+// without appending a health-check record to the audit chain.
+func (w *Writer) CheckWritable() error {
+	if w == nil {
+		return fmt.Errorf("wal writer unavailable")
+	}
+	w.mu.Lock()
+	dir := w.dir
+	w.mu.Unlock()
+
+	if dir == "" {
+		return fmt.Errorf("wal dir empty")
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("create wal dir: %w", err)
+	}
+	f, err := os.CreateTemp(dir, ".wal-health-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create wal health file: %w", err)
+	}
+	name := f.Name()
+	defer func() {
+		_ = os.Remove(name)
+	}()
+	if _, err := f.Write([]byte("ok\n")); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("write wal health file: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("sync wal health file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close wal health file: %w", err)
+	}
+	return nil
 }
 
 // writeChainRestartMarkerLocked writes a chain restart marker to the WAL.
