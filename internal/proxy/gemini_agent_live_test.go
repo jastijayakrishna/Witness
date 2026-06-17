@@ -12,14 +12,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/witness-proxy/witness-proxy/internal/providers"
-	"github.com/witness-proxy/witness-proxy/internal/receiptverify"
+	"github.com/hubbleops/hubbleops/internal/privacy"
+	"github.com/hubbleops/hubbleops/internal/providers"
+	"github.com/hubbleops/hubbleops/internal/receiptverify"
 )
 
 func TestLiveGeminiAgentActionFirewallDuplicateAndDangerous(t *testing.T) {
 	key := liveGeminiKey(t)
-	if os.Getenv("WITNESS_LIVE_GEMINI_AGENT") != "1" {
-		t.Skip("set WITNESS_LIVE_GEMINI_AGENT=1 to run live Gemini agent action-firewall tests")
+	if os.Getenv("HUBBLEOPS_LIVE_GEMINI_AGENT") != "1" {
+		t.Skip("set HUBBLEOPS_LIVE_GEMINI_AGENT=1 to run live Gemini agent action-firewall tests")
 	}
 	handler, walDir := newToolEventHandler(t, "block")
 
@@ -71,7 +72,7 @@ func TestLiveGeminiAgentActionFirewallDuplicateAndDangerous(t *testing.T) {
 	if err := json.Unmarshal(duplicate.Body.Bytes(), &dupResp); err != nil {
 		t.Fatalf("parse duplicate response: %v", err)
 	}
-	if dupResp["action"] != "block" || dupResp["idempotency_key"] != idempotencyKey {
+	if dupResp["action"] != "block" || dupResp["idempotency_key_hash"] != privacy.FingerprintString(idempotencyKey) {
 		t.Fatalf("duplicate response did not block duplicate key: %s", duplicate.Body.String())
 	}
 
@@ -147,7 +148,7 @@ func liveGeminiAgentCall(t *testing.T, key, functionName, description string, sc
 		t.Fatalf("new Gemini agent request: %v", err)
 	}
 	req.Header.Set("x-goog-api-key", key)
-	req.Header.Set("User-Agent", "witness-live-agent-test/0")
+	req.Header.Set("User-Agent", "hubbleops-live-agent-test/0")
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
