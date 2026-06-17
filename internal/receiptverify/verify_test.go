@@ -7,10 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/witness-proxy/witness-proxy/internal/loop"
-	"github.com/witness-proxy/witness-proxy/internal/receipts"
-	"github.com/witness-proxy/witness-proxy/internal/shadowreport"
-	"github.com/witness-proxy/witness-proxy/internal/wal"
+	"github.com/hubbleops/hubbleops/internal/loop"
+	"github.com/hubbleops/hubbleops/internal/receipts"
+	"github.com/hubbleops/hubbleops/internal/shadowreport"
+	"github.com/hubbleops/hubbleops/internal/wal"
 )
 
 func TestVerifyValidReceiptChain(t *testing.T) {
@@ -115,6 +115,49 @@ func TestVerifyDetectsReceiptSignatureMismatch(t *testing.T) {
 	}
 	if report.SignatureMismatches != 1 {
 		t.Fatalf("signature_mismatches=%d want 1", report.SignatureMismatches)
+	}
+}
+
+func TestVerifyResultStageReceiptHasNoPolicyGap(t *testing.T) {
+	// The post-execution (post_tool) result receipt records an outcome, not a policy
+	// decision — the action firewall only runs at pre_tool — so it carries no action
+	// policy version and must NOT be flagged as a field gap. Regression for the audit
+	// reading verified=false on a fully intact, signed, chained WAL.
+	rec := receiptRecord("dec_result", "genesis")
+	rec.Model = "post_tool"
+	rec.DecisionStage = "post_tool"
+	rec.LoopAction = "allow"
+	rec.LoopSignalsFired = ""
+	rec.DecisionReason = "No loop pattern detected."
+	rec.PolicyVersion = "" // result stage makes no policy decision
+	if err := wal.Chain(&rec, "genesis"); err != nil {
+		t.Fatalf("chain: %v", err)
+	}
+
+	report := Verify([]wal.Record{rec})
+	if report.ReceiptFieldGaps != 0 {
+		t.Fatalf("result-stage receipt flagged as a gap: %+v", report)
+	}
+	if !report.Verified {
+		t.Fatalf("intact result-stage receipt should verify: %+v", report)
+	}
+}
+
+func TestVerifyPreToolWriteStillRequiresPolicyVersion(t *testing.T) {
+	// A pre_tool decision receipt for a write action that judged the action without a
+	// policy version is still a real gap — the stage-scoping must not weaken this.
+	rec := receiptRecord("dec_decision", "genesis")
+	rec.PolicyVersion = ""
+	if err := wal.Chain(&rec, "genesis"); err != nil {
+		t.Fatalf("chain: %v", err)
+	}
+
+	report := Verify([]wal.Record{rec})
+	if report.ReceiptFieldGaps != 1 {
+		t.Fatalf("pre_tool write without policy_version must be a gap: %+v", report)
+	}
+	if report.Verified {
+		t.Fatalf("decision receipt missing policy_version should not verify: %+v", report)
 	}
 }
 

@@ -1,9 +1,9 @@
 package receiptverify
 
 import (
-	"github.com/witness-proxy/witness-proxy/internal/loop"
-	"github.com/witness-proxy/witness-proxy/internal/receipts"
-	"github.com/witness-proxy/witness-proxy/internal/wal"
+	"github.com/hubbleops/hubbleops/internal/loop"
+	"github.com/hubbleops/hubbleops/internal/receipts"
+	"github.com/hubbleops/hubbleops/internal/wal"
 )
 
 type Report struct {
@@ -29,11 +29,26 @@ func Verify(records []wal.Record) Report {
 
 type Options struct {
 	ReceiptSecret     string
+	ReceiptPublicKey  string
 	RequireSignatures bool
 }
 
 func VerifyWithOptions(records []wal.Record, opts Options) Report {
 	report := Report{TotalRecords: len(records), ChainBrokenAt: -1, Verified: true}
+	// An external auditor verifies with only the published Ed25519 public key; the secret
+	// path is for operators. A public key takes precedence when both are supplied.
+	var verify func(wal.Record) error
+	if opts.ReceiptPublicKey != "" {
+		if pub, err := receipts.ParsePublicKey(opts.ReceiptPublicKey); err == nil {
+			verify = func(rec wal.Record) error { return receipts.VerifyRecordWithPublicKey(pub, rec) }
+		} else {
+			report.Recommendation = "invalid receipt public key: " + err.Error()
+			report.Verified = false
+			return report
+		}
+	} else if opts.ReceiptSecret != "" {
+		verify = func(rec wal.Record) error { return receipts.VerifyRecord([]byte(opts.ReceiptSecret), rec) }
+	}
 	for i, rec := range records {
 		if rec.PrevHash == "" || rec.RecordHash == "" {
 			report.MissingHashes++
@@ -51,8 +66,8 @@ func VerifyWithOptions(records []wal.Record, opts Options) Report {
 				report.UnsignedReceipts++
 			} else {
 				report.SignedReceipts++
-				if opts.ReceiptSecret != "" {
-					if err := receipts.VerifyRecord([]byte(opts.ReceiptSecret), rec); err != nil {
+				if verify != nil {
+					if err := verify(rec); err != nil {
 						report.SignatureMismatches++
 						if report.FirstSignatureMismatchDecisionID == "" {
 							report.FirstSignatureMismatchDecisionID = rec.DecisionID
@@ -90,8 +105,12 @@ func receiptHasGap(rec wal.Record) bool {
 	if rec.DetectorVersion == "" || rec.LoopAction == "" || rec.DecisionReason == "" {
 		return true
 	}
+	// A policy version is only expected on the decision-stage (pre_tool) receipt that
+	// actually judged the action. The post_tool result receipt records the outcome of a
+	// side effect, not a policy decision, so it legitimately carries no action policy
+	// version and must not be flagged — doing so dragged verified=false on intact WALs.
 	risk := loop.NormalizeActionRisk(rec.ActionRisk)
-	if risk != loop.ActionRiskRead && risk != "" {
+	if rec.DecisionStage == "pre_tool" && risk != loop.ActionRiskRead && risk != "" {
 		return rec.PolicyVersion == ""
 	}
 	return false
