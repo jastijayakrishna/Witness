@@ -16,9 +16,9 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
 
-	"github.com/witness-proxy/witness-proxy/internal/loop"
-	"github.com/witness-proxy/witness-proxy/internal/providers"
-	"github.com/witness-proxy/witness-proxy/internal/wal"
+	"github.com/hubbleops/hubbleops/internal/loop"
+	"github.com/hubbleops/hubbleops/internal/providers"
+	"github.com/hubbleops/hubbleops/internal/wal"
 )
 
 func newTestHandler(t *testing.T) (*Handler, string) {
@@ -124,8 +124,202 @@ func TestHandler_NonStreamOpenAI(t *testing.T) {
 	if wr.Stream {
 		t.Error("wal stream should be false for non-streaming")
 	}
+	if wr.DecisionStage != "post_llm" || wr.PolicyVersion != "loop_post_observe_v1" || wr.DetectorVersion == "" {
+		t.Errorf("wal decision metadata missing: stage=%q policy=%q detector=%q", wr.DecisionStage, wr.PolicyVersion, wr.DetectorVersion)
+	}
 	if wr.Cost <= 0 {
 		t.Errorf("wal cost = %f, should be > 0", wr.Cost)
+	}
+}
+
+func TestBudgetBlockWritesDecisionReceipt(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { rdb.Close() })
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("upstream should not be called when budget pre-check blocks")
+	}))
+	defer upstream.Close()
+	origTarget := providers.Registry["/openai"].Target
+	target, _ := url.Parse(upstream.URL)
+	providers.Registry["/openai"].Target = target
+	defer func() { providers.Registry["/openai"].Target = origTarget }()
+
+	dir := t.TempDir()
+	walWriter, err := wal.NewWriter(dir, "sync")
+	if err != nil {
+		t.Fatalf("new wal writer: %v", err)
+	}
+	t.Cleanup(func() { walWriter.Close() })
+
+	handler := NewHandler(walWriter, nil, loop.DefaultConfig())
+	handler.BudgetEnforcer = loop.NewBudgetEnforcer(rdb, 0, 0.10, 0.20)
+
+	req := httptest.NewRequest("POST", "/openai/v1/chat/completions", strings.NewReader(`{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer sk-test")
+	req.Header.Set("X-Project", "budget-receipt")
+	req.Header.Set("X-Session-ID", "budget-session")
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status=%d want 429 body=%s", rec.Code, rec.Body.String())
+	}
+
+	handler.WAL.Close()
+	records := readWALRecords(t, dir)
+	if len(records) != 1 {
+		t.Fatalf("records=%d want 1", len(records))
+	}
+	got := records[0]
+	if got.DecisionStage != "pre_budget" || got.LoopAction != "block" || got.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("unexpected receipt stage/action/status: stage=%q action=%q status=%d", got.DecisionStage, got.LoopAction, got.StatusCode)
+	}
+	if got.DecisionID == "" || got.PolicyVersion == "" || got.DecisionReason == "" || got.DecisionEvidence == "" {
+		t.Fatalf("receipt fields missing: decision_id=%q policy=%q reason=%q evidence=%q", got.DecisionID, got.PolicyVersion, got.DecisionReason, got.DecisionEvidence)
+	}
+	if got.PrevHash == "" || got.RecordHash == "" {
+		t.Fatalf("hash chain missing: prev=%q record=%q", got.PrevHash, got.RecordHash)
+	}
+}
+
+func TestBudgetBlockFailsOpenWhenReceiptWriteFails(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { rdb.Close() })
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("upstream should not be called by fail-open budget response")
+	}))
+	defer upstream.Close()
+	origTarget := providers.Registry["/openai"].Target
+	target, _ := url.Parse(upstream.URL)
+	providers.Registry["/openai"].Target = target
+	defer func() { providers.Registry["/openai"].Target = origTarget }()
+
+	walWriter, err := wal.NewWriter(t.TempDir(), "sync")
+	if err != nil {
+		t.Fatalf("new wal writer: %v", err)
+	}
+	if err := walWriter.Write(wal.Record{Project: "_test", Provider: "_test", Model: "_seed", PromptHash: "seed"}); err != nil {
+		t.Fatalf("seed wal: %v", err)
+	}
+	if err := walWriter.Close(); err != nil {
+		t.Fatalf("close wal: %v", err)
+	}
+
+	handler := NewHandler(walWriter, nil, loop.DefaultConfig())
+	handler.BudgetEnforcer = loop.NewBudgetEnforcer(rdb, 0, 0.10, 0.20)
+
+	req := httptest.NewRequest("POST", "/openai/v1/chat/completions", strings.NewReader(`{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer sk-test")
+	req.Header.Set("X-Project", "budget-fail-open")
+	req.Header.Set("X-Session-ID", "budget-session")
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200 fail-open body=%s", rec.Code, rec.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse response: %v", err)
+	}
+	if resp["action"] != "allow" || resp["would_action"] != "block" || resp["fail_open"] != true {
+		t.Fatalf("unexpected fail-open response: %s", rec.Body.String())
+	}
+}
+
+func TestLoopPreBlockWritesDecisionReceipt(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { rdb.Close() })
+
+	upstreamCalls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls++
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{
+			"id": "chatcmpl-test",
+			"model": "gpt-4",
+			"choices": [{
+				"message": {
+					"role": "assistant",
+					"content": "retry",
+					"tool_calls": [{
+						"id": "call_1",
+						"type": "function",
+						"function": {"name": "search", "arguments": "{\"query\":\"fix\"}"}
+					}]
+				},
+				"finish_reason": "tool_calls"
+			}],
+			"usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110}
+		}`)
+	}))
+	defer upstream.Close()
+	origTarget := providers.Registry["/openai"].Target
+	target, _ := url.Parse(upstream.URL)
+	providers.Registry["/openai"].Target = target
+	defer func() { providers.Registry["/openai"].Target = origTarget }()
+
+	dir := t.TempDir()
+	walWriter, err := wal.NewWriter(dir, "sync")
+	if err != nil {
+		t.Fatalf("new wal writer: %v", err)
+	}
+	t.Cleanup(func() { walWriter.Close() })
+
+	cfg := loop.Config{
+		Action:                 "block",
+		MaxRepeated:            3,
+		VelocityAccelRatio:     1.5,
+		VelocityWindowMs:       1,
+		WarnConfidence:         0.40,
+		BlockConfidence:        0.70,
+		RequireSessionForBlock: true,
+	}
+	handler := NewHandler(walWriter, loop.NewStateStore(rdb), cfg)
+
+	var blockTurn int
+	for i := 0; i < 12; i++ {
+		req := httptest.NewRequest("POST", "/openai/v1/chat/completions", strings.NewReader(`{"model":"gpt-4","messages":[{"role":"user","content":"retry the failed search"}]}`))
+		req.Header.Set("Authorization", "Bearer sk-test")
+		req.Header.Set("X-Project", "loop-receipt")
+		req.Header.Set("X-Session-ID", "loop-session")
+		req.Header.Set("Content-Type", "application/json")
+
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code == http.StatusTooManyRequests {
+			blockTurn = i + 1
+			break
+		}
+		if rec.Code != http.StatusOK {
+			t.Fatalf("turn=%d status=%d body=%s", i+1, rec.Code, rec.Body.String())
+		}
+	}
+	if blockTurn == 0 {
+		t.Fatalf("loop pre-check never blocked")
+	}
+	if upstreamCalls != blockTurn-1 {
+		t.Fatalf("upstream calls=%d want %d", upstreamCalls, blockTurn-1)
+	}
+
+	handler.WAL.Close()
+	records := readWALRecords(t, dir)
+	last := records[len(records)-1]
+	if last.DecisionStage != "pre_llm" || last.LoopAction != "block" || last.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("unexpected receipt stage/action/status: stage=%q action=%q status=%d", last.DecisionStage, last.LoopAction, last.StatusCode)
+	}
+	if last.DecisionID == "" || last.PolicyVersion == "" || last.DecisionReason == "" || last.DetectorVersion == "" {
+		t.Fatalf("receipt fields missing: decision_id=%q policy=%q reason=%q detector=%q", last.DecisionID, last.PolicyVersion, last.DecisionReason, last.DetectorVersion)
+	}
+	if last.PrevHash == "" || last.RecordHash == "" {
+		t.Fatalf("hash chain missing: prev=%q record=%q", last.PrevHash, last.RecordHash)
 	}
 }
 

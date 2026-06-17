@@ -3,13 +3,11 @@ package proxy
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 
@@ -17,11 +15,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog/log"
 
-	"github.com/witness-proxy/witness-proxy/internal/attribution"
-	"github.com/witness-proxy/witness-proxy/internal/loop"
-	"github.com/witness-proxy/witness-proxy/internal/providers"
-	"github.com/witness-proxy/witness-proxy/internal/receipts"
-	"github.com/witness-proxy/witness-proxy/internal/wal"
+	"github.com/hubbleops/hubbleops/internal/attribution"
+	"github.com/hubbleops/hubbleops/internal/loop"
+	"github.com/hubbleops/hubbleops/internal/privacy"
+	"github.com/hubbleops/hubbleops/internal/providers"
+	"github.com/hubbleops/hubbleops/internal/receipts"
+	"github.com/hubbleops/hubbleops/internal/wal"
 )
 
 var (
@@ -38,71 +37,111 @@ var (
 			Help: "Total WAL write failures. Each increment is a request whose cost record was lost.",
 		},
 	)
+	decisionReceiptWriteFailures = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "hubbleops_decision_receipt_write_failures_total",
+			Help: "Total decision receipt WAL/signature write failures by stage and action.",
+		},
+		[]string{"stage", "action"},
+	)
 	loopConfidence = prometheus.NewHistogram(
 		prometheus.HistogramOpts{
-			Name:    "witness_loop_confidence",
+			Name:    "hubbleops_loop_confidence",
 			Help:    "Loop detector confidence score distribution.",
 			Buckets: []float64{0, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.0},
 		},
 	)
 	loopSignalsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "witness_loop_signals_total",
+			Name: "hubbleops_loop_signals_total",
 			Help: "Total loop signals fired by signal type.",
 		},
 		[]string{"signal"},
 	)
 	loopRedisFailures = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "witness_loop_redis_failures_total",
+			Name: "hubbleops_loop_redis_failures_total",
 			Help: "Total loop detector Redis failures (timeouts + errors) by operation.",
 		},
 		[]string{"op"},
 	)
 	upstreamTimeouts = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "witness_upstream_timeouts_total",
+			Name: "hubbleops_upstream_timeouts_total",
 			Help: "Upstream requests terminated due to timeout, by type (deadline=non-stream, idle=stream).",
 		},
 		[]string{"type"},
 	)
 	inflightGauge = prometheus.NewGauge(
 		prometheus.GaugeOpts{
-			Name: "witness_inflight_requests",
+			Name: "hubbleops_inflight_requests",
 			Help: "Number of requests currently being proxied.",
 		},
 	)
 	shedTotal = prometheus.NewCounter(
 		prometheus.CounterOpts{
-			Name: "witness_requests_shed_total",
+			Name: "hubbleops_requests_shed_total",
 			Help: "Total requests shed due to concurrency limit.",
 		},
 	)
 	loopActionsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "witness_loop_actions_total",
+			Name: "hubbleops_loop_actions_total",
 			Help: "Total loop actions taken, by action type and whether session was present.",
 		},
 		[]string{"action", "had_session"},
 	)
 	loopOverridesTotal = prometheus.NewCounter(
 		prometheus.CounterOpts{
-			Name: "witness_loop_overrides_total",
+			Name: "hubbleops_loop_overrides_total",
 			Help: "Total override tokens consumed (successful bypasses of loop blocks).",
 		},
 	)
 	budgetChecksTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "witness_budget_checks_total",
+			Name: "hubbleops_budget_checks_total",
 			Help: "Total budget checks by status (ok, soft, hard).",
 		},
 		[]string{"status"},
+	)
+	outcomeCaptureWriteFailures = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "hubbleops_outcome_capture_write_failures_total",
+			Help: "Total privacy-safe action decision outcome write failures by stage and action.",
+		},
+		[]string{"stage", "action"},
+	)
+	blockEnforcedWithoutReceiptTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "hubbleops_block_enforced_without_receipt_total",
+			Help: "Blocks enforced despite a failed receipt write (fail-closed high-risk or operator override), by stage. Each is queued to the durable dead-letter for receipt retry.",
+		},
+		[]string{"stage"},
+	)
+	receiptDeadLetterEnqueuedTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "hubbleops_receipt_deadletter_enqueued_total",
+			Help: "Decision receipts persisted to the durable dead-letter queue after a failed WAL write.",
+		},
+	)
+	receiptDeadLetterRecoveredTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "hubbleops_receipt_deadletter_recovered_total",
+			Help: "Decision receipts successfully replayed from the dead-letter queue into the WAL.",
+		},
+	)
+	receiptDeadLetterPending = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "hubbleops_receipt_deadletter_pending",
+			Help: "Decision receipts currently queued in the dead-letter queue awaiting durable write.",
+		},
 	)
 )
 
 func init() {
 	prometheus.MustRegister(normalizationRatio)
 	prometheus.MustRegister(walWriteFailures)
+	prometheus.MustRegister(decisionReceiptWriteFailures)
 	prometheus.MustRegister(loopConfidence)
 	prometheus.MustRegister(loopSignalsTotal)
 	prometheus.MustRegister(loopRedisFailures)
@@ -112,36 +151,51 @@ func init() {
 	prometheus.MustRegister(loopActionsTotal)
 	prometheus.MustRegister(loopOverridesTotal)
 	prometheus.MustRegister(budgetChecksTotal)
+	prometheus.MustRegister(outcomeCaptureWriteFailures)
+	prometheus.MustRegister(blockEnforcedWithoutReceiptTotal)
+	prometheus.MustRegister(receiptDeadLetterEnqueuedTotal)
+	prometheus.MustRegister(receiptDeadLetterRecoveredTotal)
+	prometheus.MustRegister(receiptDeadLetterPending)
 }
 
 // Handler is the main reverse-proxy handler for LLM API requests.
 type Handler struct {
-	WAL               *wal.Writer
-	Transport         *http.Transport
-	LoopStore         *loop.StateStore  // nil = loop detection disabled
-	ActionStore       *loop.ActionStore // nil = duplicate-action firewall disabled
-	LoopCfg           loop.Config
-	OverrideStore     *loop.OverrideStore  // nil = override tokens disabled
-	BudgetEnforcer    *loop.BudgetEnforcer // nil = budget enforcement disabled
-	Alerter           *loop.Alerter        // nil = alerts disabled
-	ReceiptSigner     *receipts.Signer     // nil = unsigned local/dev receipts
-	DB                *pgxpool.Pool        // nil = trajectory labels disabled
-	NonStreamTimeout  time.Duration        // total deadline for non-streaming requests
-	StreamIdleTimeout time.Duration        // max idle time between SSE events
-	Inflight          chan struct{}        // semaphore; cap = max concurrent requests
-	MaxResponseBody   int64                // max upstream response body size (0 = default)
+	WAL                    *wal.Writer
+	Transport              *http.Transport
+	LoopStore              *loop.StateStore  // nil = loop detection disabled
+	ActionStore            *loop.ActionStore // nil = duplicate-action firewall disabled
+	LimitStore             *loop.LimitStore  // nil = cumulative/velocity/breaker limits disabled
+	LoopCfg                loop.Config
+	OverrideStore          *loop.OverrideStore  // nil = override tokens disabled
+	BudgetEnforcer         *loop.BudgetEnforcer // nil = budget enforcement disabled
+	Alerter                *loop.Alerter        // nil = alerts disabled
+	ReceiptSigner          *receipts.Signer     // nil = unsigned local/dev receipts
+	ReceiptQueue           *wal.DeadLetter      // nil = no durable retry for receipts that fail to write
+	DB                     *pgxpool.Pool        // nil = trajectory labels disabled
+	OutcomeStore           OutcomeStore         // nil = data moat outcome capture disabled
+	OutcomeCapture         OutcomeCaptureConfig
+	DecisionReviewStore    DecisionReviewStore
+	ReviewRawNotes         bool
+	RawCaptureEnabled      bool
+	RequireReceiptForBlock bool          // fail open if a block receipt cannot be written
+	EnforceWithoutReceipt  bool          // explicit override: allow block even when receipt write fails
+	NonStreamTimeout       time.Duration // total deadline for non-streaming requests
+	StreamIdleTimeout      time.Duration // max idle time between SSE events
+	Inflight               chan struct{} // semaphore; cap = max concurrent requests
+	MaxResponseBody        int64         // max upstream response body size (0 = default)
 }
 
 // NewHandler creates a new proxy handler with connection pooling.
 func NewHandler(w *wal.Writer, loopStore *loop.StateStore, loopCfg loop.Config) *Handler {
 	return &Handler{
-		WAL:               w,
-		LoopStore:         loopStore,
-		LoopCfg:           loopCfg,
-		NonStreamTimeout:  upstreamNonStreamTimeout,
-		StreamIdleTimeout: upstreamStreamIdleTimeout,
-		Inflight:          make(chan struct{}, defaultMaxInflight),
-		MaxResponseBody:   maxResponseBodySize,
+		WAL:                    w,
+		LoopStore:              loopStore,
+		LoopCfg:                loopCfg,
+		RequireReceiptForBlock: true,
+		NonStreamTimeout:       upstreamNonStreamTimeout,
+		StreamIdleTimeout:      upstreamStreamIdleTimeout,
+		Inflight:               make(chan struct{}, defaultMaxInflight),
+		MaxResponseBody:        maxResponseBodySize,
 		Transport: &http.Transport{
 			MaxIdleConns:        200,
 			MaxIdleConnsPerHost: 100,
@@ -224,13 +278,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body.Close()
 
-	// Resolve attribution
+	// Resolve attribution; the session is scoped under the authenticated key identity so
+	// rotating the X-Session-ID header cannot shed loop-detector state across requests.
 	project := ResolveProject(r)
-	sessionID := ResolveSession(r)
+	sessionID := BindSession(r, ResolveSession(r))
 
-	// Check for override token (X-Witness-Override header)
+	// Check for override token (X-HubbleOps-Override header)
 	// If present and valid, consume it and allow the request to bypass loop detection
-	overrideToken := r.Header.Get("X-Witness-Override")
+	overrideToken := r.Header.Get("X-HubbleOps-Override")
 	overridden := false
 	if overrideToken != "" && h.OverrideStore != nil {
 		consumed, err := h.OverrideStore.Consume(r.Context(), overrideToken, project, sessionID)
@@ -260,11 +315,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			budgetReserved = budgetCheck.Status != loop.BudgetHardHit
 			budgetChecksTotal.WithLabelValues(string(budgetCheck.Status)).Inc()
 			if budgetCheck.Status == loop.BudgetHardHit {
+				receiptRecord, receiptErr := h.writeBudgetDecisionReceipt(r.Context(), project, sessionID, provider.Name, budgetCheck, loop.ActionBlock, http.StatusTooManyRequests)
+				if h.shouldFailOpenBlockOnReceiptError(receiptErr) {
+					writeFailOpenDecision(w, "audit WAL write failed; HubbleOps did not enforce an unaudited budget block", map[string]any{
+						"reason":        "daily budget hard limit exceeded",
+						"receipt_error": receiptErr.Error(),
+					})
+					return
+				}
+				if receiptErr != nil {
+					h.logEnforceWithoutReceipt(receiptErr, project, sessionID, "budget_block")
+					h.queueReceiptForRetry(receiptRecord, "pre_budget")
+				}
 				h.returnBudgetExceeded(w, budgetCheck)
 				return
 			}
-			if budgetCheck.Status == loop.BudgetSoftHit && h.Alerter != nil {
-				go h.sendBudgetAlert("budget_soft_limit", project, sessionID, budgetCheck)
+			if budgetCheck.Status == loop.BudgetSoftHit {
+				_, _ = h.writeBudgetDecisionReceipt(r.Context(), project, sessionID, provider.Name, budgetCheck, loop.ActionWarn, http.StatusOK)
+				if h.Alerter != nil {
+					go h.sendBudgetAlert("budget_soft_limit", project, sessionID, budgetCheck)
+				}
 			}
 		}
 	}
@@ -279,11 +349,28 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if budgetReserved {
 			h.BudgetEnforcer.Adjust(r.Context(), project, 0) // actual cost = 0
 		}
+		receiptRecord, receiptErr := h.writeLoopPreDecisionReceipt(r.Context(), project, sessionID, provider.Name, body, loopDecision, loop.ActionBlock, http.StatusTooManyRequests)
+		if h.shouldFailOpenBlockOnReceiptError(receiptErr) {
+			writeFailOpenDecision(w, "audit WAL write failed; HubbleOps did not enforce an unaudited loop block", map[string]any{
+				"reason":        loopDecision.Reason,
+				"signals":       loopDecision.SignalsFired,
+				"confidence":    loopDecision.Confidence,
+				"receipt_error": receiptErr.Error(),
+			})
+			return
+		}
+		if receiptErr != nil {
+			h.logEnforceWithoutReceipt(receiptErr, project, sessionID, "loop_block")
+			h.queueReceiptForRetry(receiptRecord, "pre_llm")
+		}
 		h.returnLoopBlocked(w, loopDecision, project, sessionID)
 		return
 	}
-	if loopDecision.ShouldWarn && h.Alerter != nil {
-		go h.sendLoopAlert("loop_detected", project, sessionID, loopDecision)
+	if loopDecision.ShouldWarn {
+		_, _ = h.writeLoopPreDecisionReceipt(r.Context(), project, sessionID, provider.Name, body, loopDecision, loop.ActionWarn, http.StatusOK)
+		if h.Alerter != nil {
+			go h.sendLoopAlert("loop_detected", project, sessionID, loopDecision)
+		}
 	}
 
 	// Check if streaming (body-based for OpenAI/Anthropic, URL-based for Gemini)
@@ -643,6 +730,7 @@ func (h *Handler) finalizeRequest(ctx context.Context, providerName string, body
 		LoopEvidence:     loopEvidence,
 		TrajectoryID:     trajectoryID(sessionID),
 		DetectorVersion:  loop.DetectorVersion,
+		PolicyVersion:    "loop_post_observe_v1",
 		NearMiss:         loopConf >= 0.50 && loopConf < 0.70,
 		ImmediateOutcome: immediateOutcome(statusCode, loopAct, resultClass),
 		Framework:        "unknown",
@@ -651,6 +739,20 @@ func (h *Handler) finalizeRequest(ctx context.Context, providerName string, body
 		walWriteFailures.Inc()
 		log.Error().Err(walErr).Msg("failed to write WAL — reconciliation gap")
 	}
+	h.capturePostLLMOutcome(ctx, postLLMOutcomeInput{
+		Project:              project,
+		SessionID:            sessionID,
+		ActionName:           firstNonEmpty(toolSig, "_prompt"),
+		ArgsFingerprint:      argsFP,
+		ProviderResponseBody: providerResponseBody,
+		ResultClass:          resultClass,
+		Action:               loopAct,
+		Signals:              loopSignals,
+		Confidence:           loopConf,
+		Reason:               loopEvidence,
+		Cost:                 cost,
+		PromptHash:           promptHash,
+	})
 }
 
 // hashPrompt produces a normalized SHA256 hash of the request body.
@@ -711,46 +813,9 @@ func computeToolFingerprints(calls []providers.ToolCall) (toolSig, argsFP string
 
 	// Canonical args: normalize dynamic values, sort keys, hash
 	normalized := attribution.NormalizePrompt(calls[0].Arguments)
-	canonical := canonicalJSON(normalized)
-	hash := sha256.Sum256([]byte(canonical))
-	argsFP = fmt.Sprintf("%x", hash[:])
+	argsFP = strings.TrimPrefix(privacy.FingerprintJSON(normalized), "sha256:")
 
 	return toolSig, argsFP
-}
-
-// canonicalJSON sorts JSON object keys for stable hashing.
-// Falls back to the input string if it's not valid JSON.
-func canonicalJSON(s string) string {
-	var v any
-	if err := json.Unmarshal([]byte(s), &v); err != nil {
-		return s
-	}
-	return canonicalValue(v)
-}
-
-func canonicalValue(v any) string {
-	switch val := v.(type) {
-	case map[string]any:
-		keys := make([]string, 0, len(val))
-		for k := range val {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		parts := make([]string, 0, len(keys))
-		for _, k := range keys {
-			parts = append(parts, fmt.Sprintf("%q:%s", k, canonicalValue(val[k])))
-		}
-		return "{" + strings.Join(parts, ",") + "}"
-	case []any:
-		parts := make([]string, 0, len(val))
-		for _, item := range val {
-			parts = append(parts, canonicalValue(item))
-		}
-		return "[" + strings.Join(parts, ",") + "]"
-	default:
-		b, _ := json.Marshal(val)
-		return string(b)
-	}
 }
 
 // loopRedisTimeout caps each Redis call in the loop detector path.
