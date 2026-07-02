@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -76,15 +77,50 @@ func TestMinIOS3ObjectLockAnchorSigV4AndWORM(t *testing.T) {
 		t.Fatalf("duplicate seq-2 publish error=%v, want ErrS3AnchorObjectExists", err)
 	}
 
-	status, body, err := minioIntegrationDeleteObject(ctx, client, bucket, anchor.checkpointKey(2))
+	// Object Lock protects VERSIONS, not keys: a DELETE without a versionId on a
+	// versioned (lock-enabled) bucket always "succeeds" by inserting a delete
+	// marker — retention never blocks that. The WORM guarantee to verify is that
+	// (a) deleting the locked VERSION is denied, and (b) the checkpoint bytes
+	// remain retrievable by version even after a delete marker hides the key.
+	seq2Key := anchor.checkpointKey(2)
+	versionID, err := minioIntegrationHeadVersionID(ctx, client, bucket, seq2Key)
 	if err != nil {
-		t.Fatalf("delete seq-2 checkpoint: %v", err)
+		t.Fatalf("head seq-2 checkpoint version: %v", err)
+	}
+	if versionID == "" {
+		t.Fatalf("seq-2 checkpoint has no version id; object lock bucket must be versioned")
+	}
+
+	status, body, err := minioIntegrationDeleteObject(ctx, client, bucket, seq2Key, versionID)
+	if err != nil {
+		t.Fatalf("delete seq-2 checkpoint version: %v", err)
 	}
 	if status >= 200 && status < 300 {
-		t.Fatalf("delete seq-2 checkpoint unexpectedly succeeded with status=%d body=%s", status, body)
+		t.Fatalf("deleting the COMPLIANCE-locked seq-2 version unexpectedly succeeded with status=%d body=%s", status, body)
 	}
-	if status != http.StatusForbidden && !strings.Contains(strings.ToLower(body), "accessdenied") && !strings.Contains(strings.ToLower(body), "objectlock") {
-		t.Fatalf("delete seq-2 checkpoint status=%d body=%s, want Object Lock/access denied failure", status, body)
+	lowerBody := strings.ToLower(body)
+	if status != http.StatusForbidden && !strings.Contains(lowerBody, "accessdenied") &&
+		!strings.Contains(lowerBody, "objectlock") && !strings.Contains(lowerBody, "worm") &&
+		!strings.Contains(lowerBody, "retention") && !strings.Contains(lowerBody, "compliance") {
+		t.Fatalf("version delete status=%d body=%s, want an Object Lock retention failure", status, body)
+	}
+
+	// A plain (versionless) delete is allowed by S3 semantics: it only writes a
+	// delete marker. The locked version must still be readable afterwards, so a
+	// credential-holding attacker can hide a checkpoint but never destroy it.
+	status, body, err = minioIntegrationDeleteObject(ctx, client, bucket, seq2Key, "")
+	if err != nil {
+		t.Fatalf("versionless delete seq-2 checkpoint: %v", err)
+	}
+	if status < 200 || status >= 300 {
+		t.Fatalf("versionless delete (delete marker) status=%d body=%s, want 2xx", status, body)
+	}
+	recovered, err := minioIntegrationGetObjectVersion(ctx, client, bucket, seq2Key, versionID)
+	if err != nil {
+		t.Fatalf("get seq-2 checkpoint by version after delete marker: %v", err)
+	}
+	if !strings.Contains(recovered, `"head-2"`) {
+		t.Fatalf("recovered seq-2 version body=%s, want original checkpoint with head-2", recovered)
 	}
 }
 
@@ -111,8 +147,12 @@ func minioIntegrationPrefix(t *testing.T) string {
 	return fmt.Sprintf("integration/%s/%d", strings.ToLower(name), time.Now().UnixNano())
 }
 
-func minioIntegrationDeleteObject(ctx context.Context, client *s3SigV4Client, bucket, key string) (int, string, error) {
-	req, err := client.newRequest(ctx, http.MethodDelete, bucket, key, nil, nil)
+func minioIntegrationDeleteObject(ctx context.Context, client *s3SigV4Client, bucket, key, versionID string) (int, string, error) {
+	var q url.Values
+	if versionID != "" {
+		q = url.Values{"versionId": []string{versionID}}
+	}
+	req, err := client.newRequest(ctx, http.MethodDelete, bucket, key, q, nil)
 	if err != nil {
 		return 0, "", err
 	}
@@ -129,4 +169,50 @@ func minioIntegrationDeleteObject(ctx context.Context, client *s3SigV4Client, bu
 		return resp.StatusCode, "", err
 	}
 	return resp.StatusCode, strings.TrimSpace(string(body)), nil
+}
+
+func minioIntegrationHeadVersionID(ctx context.Context, client *s3SigV4Client, bucket, key string) (string, error) {
+	req, err := client.newRequest(ctx, http.MethodHead, bucket, key, nil, nil)
+	if err != nil {
+		return "", err
+	}
+	if err := client.sign(req, nil); err != nil {
+		return "", err
+	}
+	resp, err := client.do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		return "", err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("head %s returned status %d", key, resp.StatusCode)
+	}
+	return strings.TrimSpace(resp.Header.Get("x-amz-version-id")), nil
+}
+
+func minioIntegrationGetObjectVersion(ctx context.Context, client *s3SigV4Client, bucket, key, versionID string) (string, error) {
+	q := url.Values{"versionId": []string{versionID}}
+	req, err := client.newRequest(ctx, http.MethodGet, bucket, key, q, nil)
+	if err != nil {
+		return "", err
+	}
+	if err := client.sign(req, nil); err != nil {
+		return "", err
+	}
+	resp, err := client.do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("get %s?versionId=%s returned status %d: %s", key, versionID, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return string(body), nil
 }
