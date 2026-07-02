@@ -1,21 +1,25 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog/log"
 
 	"github.com/hubbleops/hubbleops/internal/actionreceipt"
 	"github.com/hubbleops/hubbleops/internal/approval"
 	"github.com/hubbleops/hubbleops/internal/config"
 	"github.com/hubbleops/hubbleops/internal/githubapp"
+	"github.com/hubbleops/hubbleops/internal/loop"
 	"github.com/hubbleops/hubbleops/internal/policy"
 	"github.com/hubbleops/hubbleops/internal/receipts"
 	"github.com/hubbleops/hubbleops/internal/wal"
@@ -48,9 +52,13 @@ type gateRuntime struct {
 	server              *server
 	warnings            []string
 	redactedSummaryJSON string
+	stopLedgerSweep     func()
 }
 
 func (r gateRuntime) Close() error {
+	if r.stopLedgerSweep != nil {
+		r.stopLedgerSweep()
+	}
 	if r.server == nil {
 		return nil
 	}
@@ -186,7 +194,81 @@ func newGateRuntime(args []string) (gateRuntime, error) {
 		webhookSecret: *webhookSecret,
 		checkName:     *checkName,
 	}
+	sweepInterval, sweepWarning := ledgerSweepIntervalFromEnv()
+	if sweepWarning != "" {
+		runtime.warnings = append(runtime.warnings, sweepWarning)
+	}
+	if sweepInterval > 0 {
+		sweepStore, cleanup, err := newGateLedgerSweepStore(cfg)
+		if err != nil {
+			return runtime, fmt.Errorf("configure action ledger sweeper: %w", err)
+		}
+		runtime.stopLedgerSweep = startLedgerSweepLoop(sweepStore, sweepInterval, cleanup)
+	}
 	return runtime, nil
+}
+
+func ledgerSweepIntervalFromEnv() (time.Duration, string) {
+	raw := strings.TrimSpace(os.Getenv("HUBBLEOPS_LEDGER_SWEEP_INTERVAL"))
+	if raw == "" {
+		return 10 * time.Minute, ""
+	}
+	if raw == "0" {
+		return 0, ""
+	}
+	if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+		return d, ""
+	}
+	if seconds, err := strconv.Atoi(raw); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second, ""
+	}
+	return 10 * time.Minute, "invalid HUBBLEOPS_LEDGER_SWEEP_INTERVAL; using 10m"
+}
+
+func newGateLedgerSweepStore(cfg *config.Config) (*loop.ActionStore, func(), error) {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("HUBBLEOPS_ACTION_LEDGER_BACKEND"))) {
+	case "", "file":
+		path := envOrDefault("HUBBLEOPS_ACTION_LEDGER", "data/action-ledger.json")
+		return loop.NewFileActionStore(path), nil, nil
+	case "postgres", "postgresql", "pg":
+		pool, err := pgxpool.New(context.Background(), cfg.Postgres.DSN())
+		if err != nil {
+			return nil, nil, err
+		}
+		return loop.NewPostgresActionStore(pool), pool.Close, nil
+	default:
+		return nil, nil, fmt.Errorf("unsupported HUBBLEOPS_ACTION_LEDGER_BACKEND")
+	}
+}
+
+func startLedgerSweepLoop(store *loop.ActionStore, interval time.Duration, cleanup func()) func() {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				removed, err := store.SweepExpired(ctx)
+				if err != nil {
+					log.Error().Err(err).Msg("action ledger expired-row sweep failed")
+					continue
+				}
+				log.Info().Int64("rows_removed", removed).Msg("action ledger expired-row sweep complete")
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
+		if cleanup != nil {
+			cleanup()
+		}
+	}
 }
 
 func configureReceiptSigner(cfg *config.Config, receiptKeyID, receiptSecret string) (receipts.ReceiptSigner, string, error) {
