@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -138,7 +139,10 @@ func main() {
 		pool:   pgPool,
 	}
 
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		if err := drainer.Run(ctx); err != nil {
 			log.Fatal().Err(err).Msg("drain loop failed")
 		}
@@ -147,7 +151,7 @@ func main() {
 	sig := <-sigCh
 	log.Info().Str("signal", sig.String()).Msg("shutting down")
 	cancel()
-	time.Sleep(1 * time.Second) // Give drain loop time to finish current batch
+	wg.Wait() // Run finishes its current batch, then returns on the cancelled context
 	log.Info().Msg("waldrain stopped")
 }
 
@@ -258,7 +262,7 @@ func (d *Drainer) drainOnce(ctx context.Context) error {
 			log.Info().
 				Str("file", baseName).
 				Int64("byte_offset", offset.ByteOffset).
-				Str("last_hash", lastHash[:16]+"...").
+				Str("last_hash", shortHash(lastHash)).
 				Uint64("last_seq", lastSeq).
 				Msg("batch drained")
 		}
@@ -414,8 +418,8 @@ func (d *Drainer) drainFile(ctx context.Context, path string, startByte int64, p
 			chainRestarts.Inc()
 			log.Warn().
 				Int("index", i).
-				Str("prev_hash", rec.PrevHash[:16]+"...").
-				Str("record_hash", rec.RecordHash[:16]+"...").
+				Str("prev_hash", shortHash(rec.PrevHash)).
+				Str("record_hash", shortHash(rec.RecordHash)).
 				Msg("chain restart marker: crash recovery boundary")
 		}
 	}
@@ -577,6 +581,15 @@ func (d *Drainer) saveOffset(offset drainOffset) error {
 	}
 
 	return nil
+}
+
+// shortHash abbreviates a hash for log lines. Short values (e.g. "genesis" or
+// an empty hash) are returned as-is instead of panicking on a fixed slice.
+func shortHash(s string) string {
+	if len(s) <= 16 {
+		return s
+	}
+	return s[:16] + "..."
 }
 
 // frameworkOrUnknown preserves the 'unknown' column default when the WAL record

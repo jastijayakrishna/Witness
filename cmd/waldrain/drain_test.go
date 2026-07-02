@@ -580,6 +580,83 @@ func TestDrainAcceptsChainRestartAfterCorruptGap(t *testing.T) {
 	}
 }
 
+// TestShortHash guards the log-formatting helper against short and empty
+// hashes, which previously panicked as raw hash[:16] slices at two log sites.
+func TestShortHash(t *testing.T) {
+	tests := map[string]string{
+		"":        "",
+		"genesis": "genesis",
+		"0123456789abcdef": "0123456789abcdef",
+		"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef": "0123456789abcdef...",
+	}
+	for in, want := range tests {
+		if got := shortHash(in); got != want {
+			t.Errorf("shortHash(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestDrainChainRestartMarkerWithShortPrevHashDoesNotPanic: a restart marker
+// at the very start of a chain carries prev_hash "genesis" (7 chars); the
+// marker-logging path must not slice it to 16 bytes and panic.
+func TestDrainChainRestartMarkerWithShortPrevHashDoesNotPanic(t *testing.T) {
+	walDir := t.TempDir()
+	fileName := "wal-2026-05-25.jsonl"
+	path := filepath.Join(walDir, fileName)
+
+	marker := wal.Record{
+		Time:         time.Now().UTC(),
+		Project:      "_chain",
+		Provider:     "_system",
+		Model:        "_restart",
+		ChainRestart: true,
+	}
+	if err := wal.Chain(&marker, "genesis", 1); err != nil {
+		t.Fatalf("chain marker: %v", err)
+	}
+	markerLine, _ := json.Marshal(marker)
+	if err := os.WriteFile(path, append(markerLine, '\n'), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var totalInserted int
+	drainer := &Drainer{
+		walDir: walDir,
+		insert: func(ctx context.Context, records []wal.Record) error {
+			totalInserted += len(records)
+			return nil
+		},
+	}
+	if err := drainer.drainOnce(context.Background()); err != nil {
+		t.Fatalf("drainOnce: %v", err)
+	}
+	if totalInserted != 1 {
+		t.Fatalf("drained %d records, want 1 (the marker)", totalInserted)
+	}
+}
+
+// TestDrainerRunStopsOnCancel pins the contract main()'s shutdown WaitGroup
+// relies on: Run returns promptly once the context is cancelled.
+func TestDrainerRunStopsOnCancel(t *testing.T) {
+	drainer := &Drainer{
+		walDir: t.TempDir(),
+		insert: func(ctx context.Context, records []wal.Record) error { return nil },
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- drainer.Run(ctx) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned error on cancel: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return within 2s of context cancellation")
+	}
+}
+
 // --- helpers ---
 
 var testSeqByHash = map[string]uint64{"genesis": 0}
