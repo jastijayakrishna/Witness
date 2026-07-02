@@ -2,7 +2,6 @@ package receiptverify
 
 import (
 	"github.com/hubbleops/hubbleops/internal/loop"
-	"github.com/hubbleops/hubbleops/internal/receipts"
 	"github.com/hubbleops/hubbleops/internal/wal"
 )
 
@@ -16,11 +15,20 @@ type Report struct {
 	SignatureMismatches              int    `json:"signature_mismatches"`
 	ChainBrokenAt                    int    `json:"chain_broken_at"`
 	ReceiptFieldGaps                 int    `json:"receipt_field_gaps"`
+	MissingSeq                       int    `json:"missing_seq"`
+	SeqGaps                          int    `json:"seq_gaps"`
+	AnchorMismatches                 int    `json:"anchor_mismatches"`
+	AnchorSignatureMismatches        int    `json:"anchor_signature_mismatches"`
 	LastRecordHash                   string `json:"last_record_hash,omitempty"`
+	MaxSeq                           uint64 `json:"max_seq,omitempty"`
 	Verified                         bool   `json:"verified"`
 	Recommendation                   string `json:"recommendation,omitempty"`
 	FirstGapDecisionID               string `json:"first_gap_decision_id,omitempty"`
+	FirstSeqGapDecisionID            string `json:"first_seq_gap_decision_id,omitempty"`
+	ChainBrokenDecisionID            string `json:"chain_broken_decision_id,omitempty"`
 	FirstSignatureMismatchDecisionID string `json:"first_signature_mismatch_decision_id,omitempty"`
+	AnchorSeq                        uint64 `json:"anchor_seq,omitempty"`
+	AnchorHeadHash                   string `json:"anchor_head_hash,omitempty"`
 }
 
 func Verify(records []wal.Record) Report {
@@ -30,75 +38,36 @@ func Verify(records []wal.Record) Report {
 type Options struct {
 	ReceiptSecret     string
 	ReceiptPublicKey  string
+	ReceiptPublicKeys map[string]string // key_id -> base64 public key, for verifying across rotation
 	RequireSignatures bool
+	Legacy            bool
+	Anchor            wal.Anchor
 }
 
+// VerifyWithOptions verifies an in-memory slice by feeding it through the streaming
+// Verifier, so the slice and streaming paths share identical logic.
 func VerifyWithOptions(records []wal.Record, opts Options) Report {
-	report := Report{TotalRecords: len(records), ChainBrokenAt: -1, Verified: true}
-	// An external auditor verifies with only the published Ed25519 public key; the secret
-	// path is for operators. A public key takes precedence when both are supplied.
-	var verify func(wal.Record) error
-	if opts.ReceiptPublicKey != "" {
-		if pub, err := receipts.ParsePublicKey(opts.ReceiptPublicKey); err == nil {
-			verify = func(rec wal.Record) error { return receipts.VerifyRecordWithPublicKey(pub, rec) }
-		} else {
-			report.Recommendation = "invalid receipt public key: " + err.Error()
-			report.Verified = false
-			return report
-		}
-	} else if opts.ReceiptSecret != "" {
-		verify = func(rec wal.Record) error { return receipts.VerifyRecord([]byte(opts.ReceiptSecret), rec) }
+	v, err := NewVerifier(opts)
+	if err != nil {
+		return Report{ChainBrokenAt: -1, Verified: false, Recommendation: err.Error()}
 	}
-	for i, rec := range records {
-		if rec.PrevHash == "" || rec.RecordHash == "" {
-			report.MissingHashes++
-		} else {
-			if wal.RecomputeHash(rec) != rec.RecordHash {
-				report.HashMismatches++
-			}
-		}
-		if rec.RecordHash != "" {
-			report.LastRecordHash = rec.RecordHash
-		}
-		if rec.DecisionID != "" {
-			report.ActionReceipts++
-			if rec.ReceiptSignature == "" {
-				report.UnsignedReceipts++
-			} else {
-				report.SignedReceipts++
-				if verify != nil {
-					if err := verify(rec); err != nil {
-						report.SignatureMismatches++
-						if report.FirstSignatureMismatchDecisionID == "" {
-							report.FirstSignatureMismatchDecisionID = rec.DecisionID
-						}
-					}
-				}
-			}
-			if receiptHasGap(rec) {
-				report.ReceiptFieldGaps++
-				if report.FirstGapDecisionID == "" {
-					report.FirstGapDecisionID = rec.DecisionID
-				}
-			}
-		}
-		if i > 0 && rec.PrevHash != records[i-1].RecordHash && report.ChainBrokenAt == -1 {
-			report.ChainBrokenAt = i
-		}
+	for i := range records {
+		v.Add(records[i])
 	}
-	report.Verified = report.MissingHashes == 0 &&
-		report.HashMismatches == 0 &&
-		report.SignatureMismatches == 0 &&
-		report.ChainBrokenAt == -1 &&
-		report.ReceiptFieldGaps == 0 &&
-		(!opts.RequireSignatures || report.UnsignedReceipts == 0)
-	if !report.Verified {
-		report.Recommendation = "treat this audit export as untrusted until hash mismatches, signature mismatches, chain breaks, and receipt field gaps are resolved"
-	}
-	return report
+	return v.Report()
 }
 
 func receiptHasGap(rec wal.Record) bool {
+	if rec.Provider == "_preflight" {
+		return rec.Project == "" ||
+			rec.SessionID == "" ||
+			rec.DecisionID == "" ||
+			rec.Actor == "" ||
+			rec.Action == "" ||
+			rec.Decision == "" ||
+			rec.PolicyVersion == "" ||
+			rec.DecisionReason == ""
+	}
 	if rec.Provider != "_tool" {
 		return false
 	}

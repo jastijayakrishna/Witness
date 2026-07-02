@@ -52,7 +52,7 @@ type ActionDecisionOutcome struct {
 	ResultFingerprint      string
 	ResultClass            string
 	StateDeltaHash         string
-	HubbleOpsAction          string
+	HubbleOpsAction        string
 	DecisionReason         string
 	EvidenceJSON           []byte
 	PolicyVersion          string
@@ -376,7 +376,7 @@ func validateOutcome(outcome ActionDecisionOutcome) error {
 		"action_name":      outcome.ActionName,
 		"action_type":      outcome.ActionType,
 		"action_risk":      outcome.ActionRisk,
-		"hubbleops_action":   outcome.HubbleOpsAction,
+		"hubbleops_action": outcome.HubbleOpsAction,
 		"policy_version":   outcome.PolicyVersion,
 		"detector_version": outcome.DetectorVersion,
 	}

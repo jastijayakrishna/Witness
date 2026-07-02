@@ -159,33 +159,33 @@ func TestChainHeadSaveLoad(t *testing.T) {
 	hash1 := "abc123def456"
 
 	// Save
-	if err := saveChainHead(tmpDir, hash1); err != nil {
+	if err := saveChainHead(tmpDir, hash1, 1); err != nil {
 		t.Fatalf("save failed: %v", err)
 	}
 
 	// Load
-	loaded, err := loadChainHead(tmpDir)
+	loaded, seq, err := loadChainHead(tmpDir)
 	if err != nil {
 		t.Fatalf("load failed: %v", err)
 	}
 
-	if loaded != hash1 {
-		t.Errorf("expected %s, got %s", hash1, loaded)
+	if loaded != hash1 || seq != 1 {
+		t.Errorf("expected %s/1, got %s/%d", hash1, loaded, seq)
 	}
 
 	// Overwrite
 	hash2 := "xyz789"
-	if err := saveChainHead(tmpDir, hash2); err != nil {
+	if err := saveChainHead(tmpDir, hash2, 2); err != nil {
 		t.Fatalf("save2 failed: %v", err)
 	}
 
-	loaded, err = loadChainHead(tmpDir)
+	loaded, seq, err = loadChainHead(tmpDir)
 	if err != nil {
 		t.Fatalf("load2 failed: %v", err)
 	}
 
-	if loaded != hash2 {
-		t.Errorf("expected %s, got %s", hash2, loaded)
+	if loaded != hash2 || seq != 2 {
+		t.Errorf("expected %s/2, got %s/%d", hash2, loaded, seq)
 	}
 }
 
@@ -193,13 +193,13 @@ func TestChainHeadLoadGenesis(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// No file exists - should return genesis
-	loaded, err := loadChainHead(tmpDir)
+	loaded, seq, err := loadChainHead(tmpDir)
 	if err != nil {
 		t.Fatalf("load failed: %v", err)
 	}
 
-	if loaded != "genesis" {
-		t.Errorf("expected genesis, got %s", loaded)
+	if loaded != "genesis" || seq != 0 {
+		t.Errorf("expected genesis/0, got %s/%d", loaded, seq)
 	}
 }
 
@@ -207,7 +207,7 @@ func TestChainHeadAtomicWrite(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Save
-	if err := saveChainHead(tmpDir, "hash1"); err != nil {
+	if err := saveChainHead(tmpDir, "hash1", 1); err != nil {
 		t.Fatalf("save failed: %v", err)
 	}
 
@@ -373,7 +373,7 @@ func TestCrashGapRecovery(t *testing.T) {
 
 	// Simulate crash: overwrite chain head with the hash at record 50.
 	// On disk: 60 records. Chain head file: hash of record 50.
-	if err := saveChainHead(dir, hash50); err != nil {
+	if err := saveChainHead(dir, hash50, 50); err != nil {
 		t.Fatalf("save stale chain head: %v", err)
 	}
 

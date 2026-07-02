@@ -16,14 +16,18 @@ const (
 	genesisHash   = "genesis"
 )
 
-// chainHead stores the hash of the last written record.
+// chainHead stores the hash and sequence of the last written record.
 type chainHead struct {
 	LastHash string `json:"last_hash"`
+	LastSeq  uint64 `json:"last_seq"`
 }
 
 // Chain computes the record hash and sets prev_hash from the last committed record.
 // Called in writer.go before appending each line.
-func Chain(record *Record, prevHash string) error {
+func Chain(record *Record, prevHash string, seq ...uint64) error {
+	if len(seq) > 0 {
+		record.Seq = seq[0]
+	}
 	record.PrevHash = prevHash
 
 	oldHash := record.RecordHash
@@ -42,32 +46,32 @@ func Chain(record *Record, prevHash string) error {
 
 // loadChainHead loads the last record hash from wal-chain-head.json.
 // Returns "genesis" if the file doesn't exist (first boot).
-func loadChainHead(dir string) (string, error) {
+func loadChainHead(dir string) (string, uint64, error) {
 	path := filepath.Join(dir, chainHeadFile)
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		return genesisHash, nil
+		return genesisHash, 0, nil
 	}
 	if err != nil {
-		return "", fmt.Errorf("read chain head: %w", err)
+		return "", 0, fmt.Errorf("read chain head: %w", err)
 	}
 
 	var head chainHead
 	if err := json.Unmarshal(data, &head); err != nil {
-		return "", fmt.Errorf("parse chain head: %w", err)
+		return "", 0, fmt.Errorf("parse chain head: %w", err)
 	}
 
 	if head.LastHash == "" {
-		return genesisHash, nil
+		return genesisHash, 0, nil
 	}
 
-	return head.LastHash, nil
+	return head.LastHash, head.LastSeq, nil
 }
 
 // saveChainHead atomically writes the last record hash to wal-chain-head.json.
 // Uses write-temp + rename for atomicity.
-func saveChainHead(dir string, lastHash string) error {
-	head := chainHead{LastHash: lastHash}
+func saveChainHead(dir string, lastHash string, lastSeq uint64) error {
+	head := chainHead{LastHash: lastHash, LastSeq: lastSeq}
 	data, err := json.Marshal(head)
 	if err != nil {
 		return fmt.Errorf("marshal chain head: %w", err)
@@ -121,12 +125,18 @@ func RecomputeHash(record Record) string {
 // Uses iterative 64KB chunk scanning (up to 16MB) so it handles WAL files
 // where the tail is corrupted or contains many malformed trailing lines.
 func LastRecordHashOnDisk(dir string) (string, error) {
+	hash, _, err := LastRecordHeadOnDisk(dir)
+	return hash, err
+}
+
+// LastRecordHeadOnDisk returns the hash and sequence of the last valid WAL record.
+func LastRecordHeadOnDisk(dir string) (string, uint64, error) {
 	files, err := filepath.Glob(filepath.Join(dir, "wal-*.jsonl"))
 	if err != nil {
-		return "", fmt.Errorf("glob wal files: %w", err)
+		return "", 0, fmt.Errorf("glob wal files: %w", err)
 	}
 	if len(files) == 0 {
-		return "", nil
+		return "", 0, nil
 	}
 
 	// Files are date-sorted (wal-YYYY-MM-DD.jsonl); take the last one.
@@ -134,16 +144,16 @@ func LastRecordHashOnDisk(dir string) (string, error) {
 
 	f, err := os.Open(lastFile)
 	if err != nil {
-		return "", fmt.Errorf("open %s: %w", filepath.Base(lastFile), err)
+		return "", 0, fmt.Errorf("open %s: %w", filepath.Base(lastFile), err)
 	}
 	defer f.Close()
 
 	stat, err := f.Stat()
 	if err != nil {
-		return "", fmt.Errorf("stat %s: %w", filepath.Base(lastFile), err)
+		return "", 0, fmt.Errorf("stat %s: %w", filepath.Base(lastFile), err)
 	}
 	if stat.Size() == 0 {
-		return "", nil
+		return "", 0, nil
 	}
 
 	const maxScan = 16 << 20 // 16MB ceiling
@@ -160,7 +170,7 @@ func LastRecordHashOnDisk(dir string) (string, error) {
 
 		buf := make([]byte, readSize)
 		if _, err := f.ReadAt(buf, offset); err != nil && err != io.EOF {
-			return "", fmt.Errorf("read tail of %s: %w", filepath.Base(lastFile), err)
+			return "", 0, fmt.Errorf("read tail of %s: %w", filepath.Base(lastFile), err)
 		}
 
 		tailData = append(buf, tailData...)
@@ -176,9 +186,9 @@ func LastRecordHashOnDisk(dir string) (string, error) {
 			if err := json.Unmarshal([]byte(line), &rec); err != nil {
 				continue // skip malformed (truncated first line from offset read)
 			}
-			return rec.RecordHash, nil
+			return rec.RecordHash, rec.Seq, nil
 		}
 	}
 
-	return "", nil
+	return "", 0, nil
 }

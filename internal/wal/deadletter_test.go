@@ -23,11 +23,11 @@ func TestDeadLetterEnqueueAndDrain(t *testing.T) {
 	decisionTime := time.Now().UTC().Add(-time.Hour).Truncate(time.Millisecond)
 	for i := 0; i < 3; i++ {
 		rec := Record{
-			Project:       "p",
-			Provider:      "_tool",
-			DecisionID:    "dec_" + string(rune('a'+i)),
-			LoopAction:    "block",
-			Time:          decisionTime,
+			Project:          "p",
+			Provider:         "_tool",
+			DecisionID:       "dec_" + string(rune('a'+i)),
+			LoopAction:       "block",
+			Time:             decisionTime,
 			ReceiptSignature: "sig",
 		}
 		if err := dl.Enqueue(rec); err != nil {
@@ -147,4 +147,3 @@ func TestDeadLetterCorruptEntryIsSetAside(t *testing.T) {
 		t.Fatalf("corrupt entry not set aside as .bad: %v", statErr)
 	}
 }
-

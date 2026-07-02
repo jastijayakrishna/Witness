@@ -1,0 +1,30 @@
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data --address ":9000" --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-objectlock-data:/data
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until /usr/bin/mc alias set local http://minio:9000 minioadmin minioadmin; do
+        sleep 1;
+      done;
+      /usr/bin/mc mb --ignore-existing --with-lock local/hubbleops-audit;
+      /usr/bin/mc version enable local/hubbleops-audit;
+      /usr/bin/mc anonymous set none local/hubbleops-audit;
+      /usr/bin/mc ls local/hubbleops-audit
+      "
+
+volumes:
+  minio-objectlock-data:

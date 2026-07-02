@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"seq\":1,\"prev_hash\":\"genesis\",\"decision_id\":\"dec_seed\",\"decision\":\"block\",\"risk_score\":95}")

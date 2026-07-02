@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"seq\":1,\"decision_id\":\"dec_seed\",\"prev_hash\":\"genesis\",\"record_hash\":\"bad\",\"receipt_signature\":\"bad\"}\n")

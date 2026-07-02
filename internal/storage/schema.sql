@@ -116,6 +116,18 @@ CREATE TABLE IF NOT EXISTS wal_records (
     decision_evidence TEXT NOT NULL DEFAULT '',
     receipt_signature TEXT NOT NULL DEFAULT '',
     receipt_key_id  TEXT NOT NULL DEFAULT '',
+    actor           TEXT NOT NULL DEFAULT '',
+    human_delegator TEXT NOT NULL DEFAULT '',
+    action          TEXT NOT NULL DEFAULT '',
+    target          TEXT NOT NULL DEFAULT '',
+    environment     TEXT NOT NULL DEFAULT '',
+    intent_hash     TEXT NOT NULL DEFAULT '',
+    evidence_hashes JSONB NOT NULL DEFAULT '[]'::jsonb,
+    blast_radius    TEXT NOT NULL DEFAULT '',
+    risk_score      INT NOT NULL DEFAULT 0,
+    decision        TEXT NOT NULL DEFAULT '',
+    required_approvers JSONB NOT NULL DEFAULT '[]'::jsonb,
+    approvals       JSONB NOT NULL DEFAULT '[]'::jsonb,
     prev_hash       TEXT NOT NULL,
     record_hash     TEXT NOT NULL UNIQUE,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -160,6 +172,18 @@ ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS decision_reason     TEXT NOT NU
 ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS decision_evidence   TEXT NOT NULL DEFAULT '';
 ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS receipt_signature   TEXT NOT NULL DEFAULT '';
 ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS receipt_key_id       TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS actor                TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS human_delegator      TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS action               TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS target               TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS environment          TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS intent_hash          TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS evidence_hashes      JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS blast_radius         TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS risk_score           INT NOT NULL DEFAULT 0;
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS decision             TEXT NOT NULL DEFAULT '';
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS required_approvers   JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE wal_records ADD COLUMN IF NOT EXISTS approvals            JSONB NOT NULL DEFAULT '[]'::jsonb;
 
 -- Phase 2: WAL records indexes for reconciliation queries
 CREATE INDEX IF NOT EXISTS idx_wal_records_time ON wal_records (time);

@@ -403,6 +403,27 @@ func TestDecisionReviewRawNotesMigrationDefinesColumn(t *testing.T) {
 	}
 }
 
+func TestEngineeringPreflightReceiptMigrationDefinesColumns(t *testing.T) {
+	migrationBytes, err := migrationFS.ReadFile("migrations/0004_engineering_preflight_receipts.sql")
+	if err != nil {
+		t.Fatalf("read migration: %v", err)
+	}
+	migration := string(migrationBytes)
+	for _, want := range []string{
+		"ALTER TABLE wal_records",
+		"ADD COLUMN IF NOT EXISTS actor",
+		"ADD COLUMN IF NOT EXISTS human_delegator",
+		"ADD COLUMN IF NOT EXISTS action",
+		"ADD COLUMN IF NOT EXISTS evidence_hashes",
+		"idx_wal_records_engineering_action",
+		"idx_wal_records_engineering_decision",
+	} {
+		if !strings.Contains(migration, want) {
+			t.Fatalf("migration missing %q", want)
+		}
+	}
+}
+
 func TestDataMoatMigrationApplies(t *testing.T) {
 	dsn := os.Getenv("HUBBLEOPS_TEST_POSTGRES_DSN")
 	if dsn == "" {
@@ -440,7 +461,7 @@ func sampleOutcome(decisionID string) ActionDecisionOutcome {
 		ResultFingerprint:      testFingerprint,
 		ResultClass:            "blocked_duplicate",
 		StateDeltaHash:         testFingerprint,
-		HubbleOpsAction:          "block",
+		HubbleOpsAction:        "block",
 		DecisionReason:         "duplicate_side_effect",
 		EvidenceJSON:           []byte(`[{"signal":"duplicate_side_effect"}]`),
 		PolicyVersion:          "policy-v1",
