@@ -584,8 +584,8 @@ func TestDrainAcceptsChainRestartAfterCorruptGap(t *testing.T) {
 // hashes, which previously panicked as raw hash[:16] slices at two log sites.
 func TestShortHash(t *testing.T) {
 	tests := map[string]string{
-		"":        "",
-		"genesis": "genesis",
+		"":                 "",
+		"genesis":          "genesis",
 		"0123456789abcdef": "0123456789abcdef",
 		"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef": "0123456789abcdef...",
 	}

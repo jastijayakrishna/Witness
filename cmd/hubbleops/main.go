@@ -1,29 +1,35 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
+	"github.com/hubbleops/hubbleops/internal/action"
+	"github.com/hubbleops/hubbleops/internal/actionreceipt"
 	"github.com/hubbleops/hubbleops/internal/config"
-	"github.com/hubbleops/hubbleops/internal/doctor"
 	"github.com/hubbleops/hubbleops/internal/evidencepack"
+	"github.com/hubbleops/hubbleops/internal/gate"
 	"github.com/hubbleops/hubbleops/internal/loop"
-	"github.com/hubbleops/hubbleops/internal/loopeval"
-	"github.com/hubbleops/hubbleops/internal/outcomeexport"
+	"github.com/hubbleops/hubbleops/internal/policy"
+	"github.com/hubbleops/hubbleops/internal/preflight"
+	predeploy "github.com/hubbleops/hubbleops/internal/preflight/deploy"
+	premigration "github.com/hubbleops/hubbleops/internal/preflight/migration"
+	preterraform "github.com/hubbleops/hubbleops/internal/preflight/terraform"
+	"github.com/hubbleops/hubbleops/internal/privacy"
+	"github.com/hubbleops/hubbleops/internal/receipts"
 	"github.com/hubbleops/hubbleops/internal/receiptverify"
-	"github.com/hubbleops/hubbleops/internal/shadowreport"
-	"github.com/hubbleops/hubbleops/internal/storage"
+	"github.com/hubbleops/hubbleops/internal/wal"
 )
 
 func main() {
@@ -33,355 +39,734 @@ func main() {
 	}
 
 	switch os.Args[1] {
+	case "preflight":
+		code := runPreflight(os.Args[2:])
+		os.Exit(code)
+	case "policy":
+		os.Exit(runPolicy(os.Args[2:]))
 	case "demo":
-		runDemo(os.Args[2:])
-	case "doctor":
-		runDoctor(os.Args[2:])
-	case "eval":
-		runEval(os.Args[2:])
-	case "shadow-report":
-		runShadowReport(os.Args[2:])
+		code := runDemo(os.Args[2:])
+		os.Exit(code)
 	case "evidence-pack":
 		runEvidencePack(os.Args[2:])
 	case "verify-receipts":
-		runVerifyReceipts(os.Args[2:])
-	case "review-decision":
-		runReviewDecision(os.Args[2:])
-	case "export-outcomes":
-		runExportOutcomes(os.Args[2:])
+		os.Exit(runVerifyReceipts(os.Args[2:]))
 	default:
 		usage()
 		os.Exit(2)
 	}
 }
 
-type reviewDecisionConfig struct {
-	BaseURL    string
-	Project    string
-	APIKey     string
-	DecisionID string
-	Label      string
-	Role       string
-	Notes      string
-	Timeout    time.Duration
-}
-
-type reviewDecisionResult struct {
-	DecisionID             string    `json:"decision_id"`
-	Label                  string    `json:"label"`
-	ReviewerSource         string    `json:"reviewer_source"`
-	ReviewerRole           string    `json:"reviewer_role"`
-	NotesFingerprint       string    `json:"notes_fingerprint,omitempty"`
-	NotesStoredRaw         bool      `json:"notes_stored_raw"`
-	RepeatedReviewBehavior string    `json:"repeated_review_behavior"`
-	ReviewedAt             time.Time `json:"reviewed_at"`
-}
-
-func runReviewDecision(args []string) {
-	fs := flag.NewFlagSet("review-decision", flag.ExitOnError)
-	baseURL := fs.String("base-url", envOrDefault([]string{"HUBBLEOPS_BASE_URL", "HUBBLEOPS_URL"}, "http://localhost:8080"), "HubbleOps base URL")
-	project := fs.String("project", envOrDefault([]string{"HUBBLEOPS_PROJECT", "HUBBLEOPS_PROJECT_KEY"}, ""), "HubbleOps project")
-	apiKey := fs.String("api-key", envOrDefault([]string{"HUBBLEOPS_API_KEY", "HUBBLEOPS_PROJECT_KEY"}, ""), "HubbleOps API key")
-	decisionID := fs.String("decision", "", "decision id to review")
-	label := fs.String("label", "", "review label")
-	role := fs.String("role", "unknown", "reviewer role: developer, sre, security, founder, unknown")
-	notes := fs.String("notes", "", "optional notes; stored as a fingerprint by default")
-	timeout := fs.Duration("timeout", 3*time.Second, "request timeout")
-	jsonOut := fs.Bool("json", false, "print JSON")
-	_ = fs.Parse(args)
-
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
-	defer cancel()
-	result, err := submitDecisionReview(ctx, reviewDecisionConfig{
-		BaseURL:    *baseURL,
-		Project:    *project,
-		APIKey:     *apiKey,
-		DecisionID: *decisionID,
-		Label:      *label,
-		Role:       *role,
-		Notes:      *notes,
-		Timeout:    *timeout,
-	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "review-decision failed: %v\n", err)
-		os.Exit(1)
+func runPolicy(args []string) int {
+	if len(args) < 1 {
+		policyUsage()
+		return 2
 	}
+	switch args[0] {
+	case "validate":
+		return runPolicyValidate(args[1:])
+	default:
+		policyUsage()
+		return 2
+	}
+}
 
-	if *jsonOut {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		_ = enc.Encode(result)
+func runPolicyValidate(args []string) int {
+	fs := flag.NewFlagSet("policy validate", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	if err := fs.Parse(args); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintln(os.Stderr, "policy validate requires one policy YAML path")
+		return 2
+	}
+	pol, err := policy.Load(fs.Arg(0))
+	if err != nil {
+		printPolicyError(err)
+		return 1
+	}
+	for _, warning := range pol.Warnings {
+		fmt.Fprintln(os.Stderr, "warning: "+warning)
+	}
+	fmt.Printf("ok rules=%d\n", len(pol.Rules))
+	return 0
+}
+
+func printPolicyError(err error) {
+	var validationErr policy.ValidationError
+	if errors.As(err, &validationErr) {
+		fmt.Fprintf(os.Stderr, "invalid policy %s\n", validationErr.Path)
+		for _, problem := range validationErr.Problems {
+			fmt.Fprintln(os.Stderr, problem)
+		}
 		return
 	}
-	fmt.Printf("HubbleOps decision review\n")
-	fmt.Printf("decision_id=%s label=%s role=%s source=%s\n", result.DecisionID, result.Label, result.ReviewerRole, result.ReviewerSource)
-	if result.NotesFingerprint != "" {
-		fmt.Printf("notes_fingerprint=%s\n", result.NotesFingerprint)
-	}
-	fmt.Printf("repeated_review_behavior=%s\n", result.RepeatedReviewBehavior)
+	fmt.Fprintln(os.Stderr, err)
 }
 
-func submitDecisionReview(ctx context.Context, cfg reviewDecisionConfig) (reviewDecisionResult, error) {
-	var result reviewDecisionResult
-	if strings.TrimSpace(cfg.DecisionID) == "" {
-		return result, fmt.Errorf("-decision is required")
-	}
-	if strings.TrimSpace(cfg.Label) == "" {
-		return result, fmt.Errorf("-label is required")
-	}
-	base := strings.TrimRight(cfg.BaseURL, "/")
-	if base == "" {
-		return result, fmt.Errorf("-base-url is required")
-	}
-	body, err := json.Marshal(map[string]string{
-		"label":         strings.TrimSpace(cfg.Label),
-		"reviewer_role": strings.TrimSpace(cfg.Role),
-		"notes":         cfg.Notes,
-	})
-	if err != nil {
-		return result, fmt.Errorf("encode review: %w", err)
-	}
-	endpoint := base + "/v1/decisions/" + url.PathEscape(strings.TrimSpace(cfg.DecisionID)) + "/review"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return result, fmt.Errorf("build request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if cfg.Project != "" {
-		req.Header.Set("X-Project", cfg.Project)
-	}
-	if cfg.APIKey != "" {
-		req.Header.Set("X-HubbleOps-API-Key", cfg.APIKey)
-	}
-	client := &http.Client{Timeout: cfg.Timeout}
-	resp, err := client.Do(req)
-	if err != nil {
-		return result, fmt.Errorf("post review: %w", err)
-	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return result, fmt.Errorf("HubbleOps returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
-	}
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return result, fmt.Errorf("parse review response: %w", err)
-	}
-	return result, nil
+type preflightFlags struct {
+	Project                string
+	SessionID              string
+	Actor                  string
+	HumanDelegator         string
+	Environment            string
+	Intent                 string
+	IdempotencyKey         string
+	ServiceRisk            string
+	PolicyPath             string
+	WALDir                 string
+	ActionLedgerPath       string
+	DuplicateWindowSeconds int
+	ReceiptSecret          string
+	ReceiptKeyID           string
+	ReceiptSigner          string
+	ReceiptKMSKeyID        string
+	ReceiptKMSRegion       string
+	ReceiptKMSEndpoint     string
+	AnchorPath             string
+	JSONOut                bool
 }
 
-func runExportOutcomes(args []string) {
-	fs := flag.NewFlagSet("export-outcomes", flag.ExitOnError)
-	project := fs.String("project", envOrDefault([]string{"HUBBLEOPS_PROJECT"}, ""), "project to export")
-	sinceRaw := fs.String("since", "", "inclusive UTC day, e.g. 2026-01-01")
-	outPath := fs.String("out", "", "output JSONL path")
-	anonymize := fs.Bool("anonymize", true, "required; non-anonymized export is not supported")
-	saltEnv := fs.String("salt-env", "HUBBLEOPS_ANON_SALT", "environment variable containing anonymization salt")
-	includeCostExact := fs.Bool("include-cost-exact", false, "include exact estimated_cost_usd; default exports buckets only")
-	reviewedOnly := fs.Bool("reviewed-only", false, "exclude decisions without a customer review label")
-	configPath := fs.String("config", "configs/proxy.yaml", "HubbleOps config path")
-	timeout := fs.Duration("timeout", 15*time.Second, "export timeout")
-	_ = fs.Parse(args)
-
-	if strings.TrimSpace(*project) == "" {
-		fmt.Fprintln(os.Stderr, "-project is required")
-		os.Exit(2)
+func runPreflight(args []string) int {
+	if len(args) < 1 {
+		preflightUsage()
+		return 2
 	}
-	since, err := parseExportSince(*sinceRaw)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "invalid -since: %v\n", err)
-		os.Exit(2)
-	}
-	if strings.TrimSpace(*outPath) == "" {
-		fmt.Fprintln(os.Stderr, "-out is required")
-		os.Exit(2)
-	}
-	if !*anonymize {
-		fmt.Fprintln(os.Stderr, "non-anonymized outcome export is not supported")
-		os.Exit(2)
-	}
-	salt := os.Getenv(strings.TrimSpace(*saltEnv))
-	if strings.TrimSpace(salt) == "" {
-		fmt.Fprintf(os.Stderr, "-salt-env %s is empty; set it to a customer-approved export salt\n", *saltEnv)
-		os.Exit(2)
-	}
-
-	cfgPath := strings.TrimSpace(*configPath)
-	if cfgPath != "" {
-		if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
-			cfgPath = ""
-		}
-	}
-	cfg, err := config.Load(cfgPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
-		os.Exit(1)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
-	defer cancel()
-
-	pool, err := pgxpool.New(ctx, cfg.Postgres.DSN())
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "connect postgres: %v\n", err)
-		os.Exit(1)
-	}
-	defer pool.Close()
-
-	rows, err := storage.NewMoatStore(pool).ListActionDecisionOutcomesForExport(ctx, *project, since, *reviewedOnly)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "load outcomes: %v\n", err)
-		os.Exit(1)
-	}
-
-	out, closeOut, err := createExportOutput(*outPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "create export output: %v\n", err)
-		os.Exit(1)
-	}
-	count, writeErr := outcomeexport.WriteJSONL(out, rows, outcomeexport.Options{
-		Anonymize:        *anonymize,
-		Salt:             salt,
-		IncludeCostExact: *includeCostExact,
-		ReviewedOnly:     *reviewedOnly,
-	})
-	closeErr := closeOut()
-	if writeErr != nil {
-		fmt.Fprintf(os.Stderr, "write export: %v\n", writeErr)
-		os.Exit(1)
-	}
-	if closeErr != nil {
-		fmt.Fprintf(os.Stderr, "close export output: %v\n", closeErr)
-		os.Exit(1)
-	}
-	fmt.Printf("exported_outcomes=%d out=%s anonymized=true reviewed_only=%t include_cost_exact=%t\n",
-		count, *outPath, *reviewedOnly, *includeCostExact)
-}
-
-func parseExportSince(raw string) (time.Time, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return time.Time{}, fmt.Errorf("date is required")
-	}
-	t, err := time.Parse("2006-01-02", raw)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("use YYYY-MM-DD: %w", err)
-	}
-	return t.UTC(), nil
-}
-
-func createExportOutput(path string) (io.Writer, func() error, error) {
-	if path == "-" {
-		return os.Stdout, func() error { return nil }, nil
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
-	if err != nil {
-		return nil, nil, err
-	}
-	return f, f.Close, nil
-}
-
-func runDoctor(args []string) {
-	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
-	baseURL := fs.String("base-url", envOrDefault([]string{"HUBBLEOPS_BASE_URL", "HUBBLEOPS_URL"}, "http://localhost:8080"), "HubbleOps base URL")
-	project := fs.String("project", envOrDefault([]string{"HUBBLEOPS_PROJECT", "HUBBLEOPS_PROJECT_KEY"}, "hubbleops-doctor"), "HubbleOps project")
-	apiKey := fs.String("api-key", envOrDefault([]string{"HUBBLEOPS_API_KEY", "HUBBLEOPS_PROJECT_KEY"}, ""), "HubbleOps API key")
-	timeout := fs.Duration("timeout", 2*time.Second, "per-check timeout")
-	jsonOut := fs.Bool("json", false, "print JSON")
-	_ = fs.Parse(args)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*(*timeout))
-	defer cancel()
-
-	report := doctor.Run(ctx, doctor.Config{
-		BaseURL: *baseURL,
-		Project: *project,
-		APIKey:  *apiKey,
-		Timeout: *timeout,
-	})
-
-	if *jsonOut {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		_ = enc.Encode(report)
-	} else {
-		fmt.Printf("HubbleOps doctor\n")
-		fmt.Printf("base_url: %s\n", report.BaseURL)
-		for _, check := range report.Checks {
-			status := "ok"
-			if !check.OK {
-				status = "fail"
-			}
-			if check.Detail != "" {
-				fmt.Printf("[%s] %s: %s\n", status, check.Name, check.Detail)
-			} else {
-				fmt.Printf("[%s] %s\n", status, check.Name)
-			}
-		}
-	}
-
-	if !report.OK() {
-		os.Exit(1)
+	switch args[0] {
+	case "terraform":
+		return runPreflightTerraform(args[1:])
+	case "migration":
+		return runPreflightMigration(args[1:])
+	case "deploy":
+		return runPreflightDeploy(args[1:])
+	case "deploy-result":
+		return runPreflightDeployResult(args[1:])
+	default:
+		preflightUsage()
+		return 2
 	}
 }
 
-func runShadowReport(args []string) {
-	fs := flag.NewFlagSet("shadow-report", flag.ExitOnError)
-	format := fs.String("format", "text", "output format: text, markdown, json")
-	jsonOut := fs.Bool("json", false, "print JSON")
-	_ = fs.Parse(args)
-	if *jsonOut {
-		*format = "json"
+// runPreflightDeployResult is the post-execution callback. After the real deploy runs, CI
+// reports the outcome: a failure frees the idempotency key (so a legit retry is allowed
+// rather than blocked as a duplicate for the whole window); a success leaves it committed.
+func runPreflightDeployResult(args []string) int {
+	fs, cfg := newPreflightFlagSet("preflight deploy-result")
+	service := fs.String("service", "", "service that was deployed")
+	artifact := fs.String("artifact", envOrDefault([]string{"HUBBLEOPS_DEPLOY_ARTIFACT", "GITHUB_SHA"}, ""), "deploy artifact, version, or commit")
+	status := fs.String("status", "", "deploy result: success or failed")
+	if code, ok := parsePreflightFlags(fs, args); !ok {
+		return code
 	}
-
-	records, err := readShadowRecords(fs.Args())
+	if fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "preflight deploy-result takes flags only")
+		return 2
+	}
+	if err := validatePreflightIdentifiers(*cfg); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	serviceName := strings.TrimSpace(*service)
+	if serviceName == "" {
+		fmt.Fprintln(os.Stderr, "-service is required")
+		return 2
+	}
+	if strings.TrimSpace(cfg.ActionLedgerPath) == "" {
+		fmt.Fprintln(os.Stderr, "-action-ledger is required")
+		return 2
+	}
+	st := strings.ToLower(strings.TrimSpace(*status))
+	if st != "success" && st != "failed" {
+		fmt.Fprintln(os.Stderr, "-status must be success or failed")
+		return 2
+	}
+	pol, err := loadPolicy(cfg.PolicyPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return 1
 	}
-	report := shadowreport.Build(records)
+	cfg.IdempotencyKey = strings.TrimSpace(cfg.IdempotencyKey)
+	if cfg.IdempotencyKey == "" {
+		cfg.IdempotencyKey = deriveDeployIdempotencyKey(*cfg, serviceName, *artifact)
+	}
 
-	switch strings.ToLower(strings.TrimSpace(*format)) {
-	case "json":
+	req := baseRequest(*cfg)
+	req.Action = "deploy.result"
+	req.Target = serviceName
+	req.Evidence = append(req.Evidence, "deploy_result="+st, "service_fingerprint="+privacy.FingerprintString(serviceName))
+	if strings.TrimSpace(*artifact) != "" {
+		req.Evidence = append(req.Evidence, "deploy_artifact_hash="+privacy.FingerprintString(*artifact))
+	}
+
+	var findings []preflight.Finding
+	decision := gate.Decide(req, findings, pol)
+	if st == "failed" {
+		store := loop.NewFileActionStore(cfg.ActionLedgerPath)
+		if err := store.Invalidate(context.Background(), req.Project, cfg.IdempotencyKey); err != nil {
+			fmt.Fprintf(os.Stderr, "release deploy idempotency: %v\n", err)
+			return 1
+		}
+		decision = withDecisionEvidence(decision, []string{"deploy_idempotency=released"})
+	} else {
+		decision = withDecisionEvidence(decision, []string{"deploy_idempotency=retained"})
+	}
+	return finishPreflight(req, decision, findings, *cfg)
+}
+
+func runPreflightTerraform(args []string) int {
+	fs, cfg := newPreflightFlagSet("preflight terraform")
+	if code, ok := parsePreflightFlags(fs, args); !ok {
+		return code
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintln(os.Stderr, "preflight terraform requires one terraform show -json plan file")
+		return 2
+	}
+	if err := validatePreflightIdentifiers(*cfg); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+
+	planPath := fs.Arg(0)
+	data, err := os.ReadFile(planPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "read terraform plan: %v\n", err)
+		return 1
+	}
+	pol, err := loadPolicy(cfg.PolicyPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	var protected []string
+	if pol != nil {
+		protected = pol.ProtectedResources
+	}
+	findings, err := preterraform.Scan(strings.NewReader(string(data)), preterraform.Options{ProtectedResources: protected})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	req := baseRequest(*cfg)
+	req.Action = "terraform.plan"
+	req.Evidence = append(req.Evidence, "terraform_plan_hash="+privacy.FingerprintBytes(data))
+	targets := preflight.Targets(findings)
+	if len(targets) == 1 {
+		req.Target = targets[0]
+	}
+	if len(findings) > 0 {
+		req.Action = findings[0].Action
+	}
+
+	decision := gate.Decide(req, findings, pol)
+	return finishPreflight(req, decision, findings, *cfg)
+}
+
+func runPreflightMigration(args []string) int {
+	fs, cfg := newPreflightFlagSet("preflight migration")
+	if code, ok := parsePreflightFlags(fs, args); !ok {
+		return code
+	}
+	if fs.NArg() < 1 {
+		fmt.Fprintln(os.Stderr, "preflight migration requires at least one migration file or directory")
+		return 2
+	}
+	if err := validatePreflightIdentifiers(*cfg); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	pol, err := loadPolicy(cfg.PolicyPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	findings, err := premigration.ScanPaths(fs.Args())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	req := baseRequest(*cfg)
+	req.Action = "migration.apply"
+	req.Evidence = append(req.Evidence, "migration_input_hash="+privacy.FingerprintString(strings.Join(fs.Args(), "\x00")))
+	targets := preflight.Targets(findings)
+	if len(targets) == 1 {
+		req.Target = targets[0]
+	}
+	if len(findings) > 0 {
+		req.Action = findings[0].Action
+	}
+
+	decision := gate.Decide(req, findings, pol)
+	return finishPreflight(req, decision, findings, *cfg)
+}
+
+func runPreflightDeploy(args []string) int {
+	fs, cfg := newPreflightFlagSet("preflight deploy")
+	service := fs.String("service", "", "service being deployed")
+	artifact := fs.String("artifact", envOrDefault([]string{"HUBBLEOPS_DEPLOY_ARTIFACT", "GITHUB_SHA"}, ""), "deploy artifact, version, or commit; stored as a hash in receipts")
+	if code, ok := parsePreflightFlags(fs, args); !ok {
+		return code
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "preflight deploy takes flags only; use -service for the service name")
+		return 2
+	}
+	if err := validatePreflightIdentifiers(*cfg); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	serviceName := strings.TrimSpace(*service)
+	if serviceName == "" {
+		fmt.Fprintln(os.Stderr, "-service is required")
+		return 2
+	}
+	if strings.TrimSpace(cfg.ActionLedgerPath) == "" {
+		fmt.Fprintln(os.Stderr, "-action-ledger is required for deploy idempotency")
+		return 2
+	}
+	pol, err := loadPolicy(cfg.PolicyPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if strings.TrimSpace(cfg.ServiceRisk) == "" && pol != nil {
+		cfg.ServiceRisk = pol.ServiceRisk(serviceName)
+	}
+	cfg.ServiceRisk = predeploy.NormalizeRisk(cfg.ServiceRisk)
+	cfg.IdempotencyKey = strings.TrimSpace(cfg.IdempotencyKey)
+	if cfg.IdempotencyKey == "" {
+		cfg.IdempotencyKey = deriveDeployIdempotencyKey(*cfg, serviceName, *artifact)
+	}
+
+	req := baseRequest(*cfg)
+	req.Action = predeploy.ActionRelease
+	req.Target = serviceName
+	req.ServiceRisk = cfg.ServiceRisk
+	req.Evidence = append(req.Evidence,
+		"deploy_action=release",
+		"deploy_environment="+req.Environment,
+		"service_risk="+cfg.ServiceRisk,
+		"service_fingerprint="+privacy.FingerprintString(serviceName),
+	)
+	if strings.TrimSpace(*artifact) != "" {
+		req.Evidence = append(req.Evidence, "deploy_artifact_hash="+privacy.FingerprintString(*artifact))
+	}
+
+	findings := predeploy.Scan(predeploy.Options{
+		Service:     serviceName,
+		Environment: req.Environment,
+		ServiceRisk: cfg.ServiceRisk,
+	})
+	decision := gate.Decide(req, findings, pol)
+	claim, duplicateDecision, duplicateFindings, err := claimDeployIdempotency(req, decision, findings, *cfg)
+	if err != nil {
+		block := deployLedgerErrorDecision(req, decision, findings, err)
+		return finishPreflight(req, block, append(findings, deployLedgerFinding(req, err.Error())), *cfg)
+	}
+	if duplicateDecision != nil {
+		return finishPreflight(req, *duplicateDecision, duplicateFindings, *cfg)
+	}
+	decision = withDecisionEvidence(decision, claim.Evidence)
+	return finishPreflightWithHook(req, decision, findings, *cfg, func(written action.Decision) error {
+		return reconcileDeployIdempotency(req, written, claim, *cfg)
+	})
+}
+
+func newPreflightFlagSet(name string) (*flag.FlagSet, *preflightFlags) {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	cfg := &preflightFlags{}
+	fs.StringVar(&cfg.Project, "project", envOrDefault([]string{"HUBBLEOPS_PROJECT"}, "local"), "project identifier")
+	fs.StringVar(&cfg.SessionID, "session", envOrDefault([]string{"HUBBLEOPS_SESSION_ID"}, "cli-"+time.Now().UTC().Format("20060102T150405Z")), "session identifier")
+	fs.StringVar(&cfg.Actor, "actor", envOrDefault([]string{"HUBBLEOPS_ACTOR"}, "agent:local-cli"), "agent actor")
+	fs.StringVar(&cfg.HumanDelegator, "human-delegator", os.Getenv("HUBBLEOPS_HUMAN_DELEGATOR"), "human delegator")
+	fs.StringVar(&cfg.Environment, "env", envOrDefault([]string{"HUBBLEOPS_ENVIRONMENT", "HUBBLEOPS_ENV"}, "unknown"), "target environment")
+	fs.StringVar(&cfg.Intent, "intent", "", "operator intent; stored as a hash in receipts")
+	fs.StringVar(&cfg.IdempotencyKey, "idempotency-key", "", "stable idempotency key; stored as a hash in receipts")
+	fs.StringVar(&cfg.ServiceRisk, "service-risk", "", "service risk tier for policy rules")
+	fs.StringVar(&cfg.PolicyPath, "policy", defaultPolicyPath(), "YAML policy path")
+	fs.StringVar(&cfg.WALDir, "wal-dir", envOrDefault([]string{"HUBBLEOPS_WAL_DIR"}, "data/wal"), "WAL directory for receipt output")
+	fs.StringVar(&cfg.ActionLedgerPath, "action-ledger", envOrDefault([]string{"HUBBLEOPS_ACTION_LEDGER"}, "data/action-ledger.json"), "file-backed ActionStore ledger for deploy idempotency")
+	fs.StringVar(&cfg.ActionLedgerPath, "ledger", cfg.ActionLedgerPath, "alias for -action-ledger")
+	fs.IntVar(&cfg.DuplicateWindowSeconds, "duplicate-window-seconds", envIntOrDefault("HUBBLEOPS_DUPLICATE_WINDOW_SECONDS", 7*24*60*60), "deploy duplicate window in seconds")
+	fs.StringVar(&cfg.ReceiptSecret, "receipt-secret", receiptSecretFromEnv(), "receipt signing secret")
+	fs.StringVar(&cfg.ReceiptKeyID, "receipt-key-id", envOrDefault([]string{"HUBBLEOPS_RECEIPT_KEY_ID"}, "local"), "receipt key id")
+	fs.StringVar(&cfg.ReceiptSigner, "receipt-signer", envOrDefault([]string{"HUBBLEOPS_RECEIPT_SIGNER"}, ""), "receipt signer: none, local, aws-kms, gcp-kms, vault-transit")
+	fs.StringVar(&cfg.ReceiptKMSKeyID, "receipt-kms-key-id", envOrDefault([]string{"HUBBLEOPS_RECEIPT_KMS_KEY_ID"}, ""), "AWS KMS asymmetric key id/arn for receipt signing")
+	fs.StringVar(&cfg.ReceiptKMSRegion, "receipt-kms-region", envOrDefault([]string{"HUBBLEOPS_RECEIPT_KMS_REGION", "AWS_REGION", "AWS_DEFAULT_REGION"}, ""), "AWS KMS region for receipt signing")
+	fs.StringVar(&cfg.ReceiptKMSEndpoint, "receipt-kms-endpoint", envOrDefault([]string{"HUBBLEOPS_RECEIPT_KMS_ENDPOINT"}, ""), "optional AWS KMS endpoint override")
+	fs.StringVar(&cfg.AnchorPath, "anchor", os.Getenv("HUBBLEOPS_WAL_ANCHOR"), "receipt checkpoint anchor path, file:// URL, stdout, or s3:// URL")
+	fs.BoolVar(&cfg.JSONOut, "json", false, "print JSON")
+	return fs, cfg
+}
+
+// parsePreflightFlags parses args (flags reordered ahead of positionals) and
+// reports whether execution may continue. A flag error MUST stop the run:
+// continuing with half-parsed defaults would burn the wrong project, session,
+// or actor into a signed audit receipt. The flag package has already printed
+// the error and usage to stderr when Parse fails.
+func parsePreflightFlags(fs *flag.FlagSet, args []string) (int, bool) {
+	if err := fs.Parse(flagsFirst(fs, args)); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0, false
+		}
+		return 2, false
+	}
+	return 0, true
+}
+
+func validatePreflightIdentifiers(cfg preflightFlags) error {
+	if strings.TrimSpace(cfg.Project) == "" {
+		return fmt.Errorf("-project is required")
+	}
+	if strings.TrimSpace(cfg.SessionID) == "" {
+		return fmt.Errorf("-session is required")
+	}
+	if strings.TrimSpace(cfg.Actor) == "" {
+		return fmt.Errorf("-actor is required")
+	}
+	if strings.TrimSpace(cfg.WALDir) == "" {
+		return fmt.Errorf("-wal-dir is required")
+	}
+	return nil
+}
+
+func baseRequest(cfg preflightFlags) action.Request {
+	return action.Request{
+		Project:        strings.TrimSpace(cfg.Project),
+		SessionID:      strings.TrimSpace(cfg.SessionID),
+		Actor:          strings.TrimSpace(cfg.Actor),
+		HumanDelegator: strings.TrimSpace(cfg.HumanDelegator),
+		Environment:    normalizeEnvironment(cfg.Environment),
+		Intent:         cfg.Intent,
+		IdempotencyKey: cfg.IdempotencyKey,
+		ServiceRisk:    cfg.ServiceRisk,
+		PolicyVersion:  action.PolicyVersion,
+		CaptureMode:    privacy.CaptureModeFingerprint,
+	}
+}
+
+type deployIdempotencyClaim struct {
+	Store       *loop.ActionStore
+	Observation loop.ActionObservation
+	Evidence    []string
+	ClaimNonce  string
+}
+
+func claimDeployIdempotency(req action.Request, baseDecision action.Decision, findings []preflight.Finding, cfg preflightFlags) (deployIdempotencyClaim, *action.Decision, []preflight.Finding, error) {
+	store := loop.NewFileActionStore(cfg.ActionLedgerPath)
+	obs := deployObservation(req, cfg)
+	decision, err := store.Decide(context.Background(), obs)
+	if err != nil {
+		return deployIdempotencyClaim{}, nil, findings, err
+	}
+	claim := deployIdempotencyClaim{Store: store, Observation: obs, Evidence: decision.Evidence, ClaimNonce: decision.ClaimNonce}
+	if decision.Outcome == loop.ActionOutcomeClaimed && decision.Decision.ActionCeiling != loop.ActionBlock {
+		return claim, nil, findings, nil
+	}
+	block, allFindings := deployIdempotencyBlockDecision(req, baseDecision, findings, decision)
+	return claim, &block, allFindings, nil
+}
+
+// reconcileDeployIdempotency settles the pending idempotency lease taken before the gate
+// decision. Only an authorized (allow) deploy commits the key for the full duplicate
+// window — it is cleared to run, so a later identical attempt is a true duplicate side
+// effect. A deploy that needs approval or is blocked never executed, so its pending lease
+// is released and a re-run re-evaluates from scratch instead of being masked as a
+// duplicate.
+func reconcileDeployIdempotency(req action.Request, decision action.Decision, claim deployIdempotencyClaim, cfg preflightFlags) error {
+	if claim.Store == nil {
+		return fmt.Errorf("action ledger is not configured")
+	}
+	if decision.Decision != action.DecisionAllow {
+		return claim.Store.Release(context.Background(), req.Project, req.IdempotencyKey, claim.ClaimNonce)
+	}
+	return claim.Store.Commit(context.Background(), loop.ActionResult{
+		Project:                req.Project,
+		IdempotencyKey:         req.IdempotencyKey,
+		ClaimNonce:             claim.ClaimNonce,
+		ToolName:               req.Action,
+		ActionRisk:             claim.Observation.ActionRisk,
+		RawActionRisk:          claim.Observation.RawActionRisk,
+		ResourceID:             claim.Observation.ResourceID,
+		DecisionID:             decision.DecisionID,
+		ResultClass:            receiptResultClass(decision.Decision),
+		ResultFingerprint:      decision.ReceiptID,
+		DuplicateWindowSeconds: cfg.DuplicateWindowSeconds,
+	})
+}
+
+func deployObservation(req action.Request, cfg preflightFlags) loop.ActionObservation {
+	risk := deployActionRisk(req.ServiceRisk, req.Environment)
+	return loop.ActionObservation{
+		Project:                req.Project,
+		SessionID:              req.SessionID,
+		StepID:                 "preflight-deploy",
+		ToolName:               req.Action,
+		ActionRisk:             risk,
+		RawActionRisk:          risk,
+		IdempotencyKey:         req.IdempotencyKey,
+		AgentID:                req.Actor,
+		UserID:                 req.HumanDelegator,
+		ResourceID:             req.Environment + "/" + req.Target,
+		DuplicateWindowSeconds: cfg.DuplicateWindowSeconds,
+	}
+}
+
+func deployActionRisk(serviceRisk, env string) string {
+	serviceRisk = predeploy.NormalizeRisk(serviceRisk)
+	production := normalizeEnvironment(env) == "production"
+	switch serviceRisk {
+	case "tier_0", "tier0", "critical":
+		return loop.ActionRiskDangerous
+	case "tier_1", "tier1", "high":
+		if production {
+			return loop.ActionRiskDangerous
+		}
+		return loop.ActionRiskWrite
+	default:
+		return loop.ActionRiskWrite
+	}
+}
+
+func deployIdempotencyBlockDecision(req action.Request, baseDecision action.Decision, findings []preflight.Finding, storeDecision loop.ActionDecision) (action.Decision, []preflight.Finding) {
+	kind := preflight.KindDeployDuplicate
+	next := []string{"use_existing_receipt", "open_review"}
+	switch storeDecision.Outcome {
+	case loop.ActionOutcomeInFlight:
+		next = []string{"retry_later", "open_review"}
+	case loop.ActionOutcomeMismatch:
+		next = []string{"fix_idempotency_key", "open_review"}
+	}
+	finding := preflight.Finding{
+		Source:    preflight.SourceDeploy,
+		Kind:      kind,
+		Action:    req.Action,
+		Target:    req.Target,
+		RiskScore: 100,
+		RiskClass: action.RiskCritical,
+		Evidence:  append([]string{"deploy_idempotency=" + firstNonEmpty(storeDecision.Outcome, "blocked")}, storeDecision.Evidence...),
+		ChangeTags: []string{
+			"deploy:idempotency",
+			"idempotency:" + firstNonEmpty(storeDecision.Outcome, "blocked"),
+		},
+	}
+	allFindings := append(append([]preflight.Finding{}, findings...), finding)
+	decision := gate.Decide(req, allFindings, nil)
+	decision.Decision = action.DecisionBlock
+	decision.Reason = firstNonEmpty(storeDecision.Reason, storeDecision.Decision.Reason, "deploy idempotency check blocked this action")
+	decision.RiskScore = 100
+	decision.RiskClass = action.RiskCritical
+	decision.RequiredApprovers = nil
+	decision.AllowedNextActions = next
+	decision.PolicyVersion = firstNonEmpty(baseDecision.PolicyVersion, action.PolicyVersion)
+	decision.Evidence = appendUnique(baseDecision.Evidence, finding.Evidence...)
+	decision.PolicyRuleID = baseDecision.PolicyRuleID
+	decision.RequiresReceipt = true
+	return decision, allFindings
+}
+
+func deployLedgerErrorDecision(req action.Request, baseDecision action.Decision, findings []preflight.Finding, err error) action.Decision {
+	allFindings := append(append([]preflight.Finding{}, findings...), deployLedgerFinding(req, err.Error()))
+	decision := gate.Decide(req, allFindings, nil)
+	decision.Decision = action.DecisionBlock
+	decision.Reason = "deploy idempotency ledger unavailable; blocking before release"
+	decision.RiskScore = 100
+	decision.RiskClass = action.RiskCritical
+	decision.AllowedNextActions = []string{"fix_idempotency_ledger", "open_review"}
+	decision.PolicyVersion = firstNonEmpty(baseDecision.PolicyVersion, action.PolicyVersion)
+	decision.Evidence = appendUnique(baseDecision.Evidence, "deploy_idempotency=ledger_error", "ledger_error="+privacy.FingerprintString(err.Error()))
+	decision.RequiresReceipt = true
+	return decision
+}
+
+func deployLedgerFinding(req action.Request, evidence string) preflight.Finding {
+	return preflight.Finding{
+		Source:    preflight.SourceDeploy,
+		Kind:      preflight.KindDeployLedgerError,
+		Action:    req.Action,
+		Target:    req.Target,
+		RiskScore: 100,
+		RiskClass: action.RiskCritical,
+		Evidence: []string{
+			"deploy_idempotency=ledger_error",
+			"ledger_error=" + privacy.FingerprintString(evidence),
+		},
+		ChangeTags: []string{"deploy:idempotency", "idempotency:ledger_error"},
+	}
+}
+
+func deriveDeployIdempotencyKey(cfg preflightFlags, service, artifact string) string {
+	// Identity is project/env/service/artifact — NOT intent — so the preflight and the
+	// deploy-result callback derive the same key for the same deploy.
+	parts := []string{
+		strings.TrimSpace(cfg.Project),
+		normalizeEnvironment(cfg.Environment),
+		strings.TrimSpace(service),
+		strings.TrimSpace(artifact),
+	}
+	return "deploy:" + strings.TrimPrefix(privacy.FingerprintString(strings.Join(parts, "\x00")), "sha256:")
+}
+
+func receiptResultClass(decision string) string {
+	switch decision {
+	case action.DecisionBlock:
+		return "blocked"
+	case action.DecisionRequireApproval:
+		return "requires_review"
+	default:
+		return "allowed"
+	}
+}
+
+func appendUnique(base []string, values ...string) []string {
+	seen := map[string]struct{}{}
+	var out []string
+	for _, value := range append(append([]string{}, base...), values...) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
+func withDecisionEvidence(decision action.Decision, evidence []string) action.Decision {
+	decision.Evidence = appendUnique(decision.Evidence, evidence...)
+	seen := map[string]struct{}{}
+	for _, hash := range decision.EvidenceHashes {
+		seen[hash] = struct{}{}
+	}
+	for _, item := range evidence {
+		fp := privacy.FingerprintString(item)
+		if _, ok := seen[fp]; ok {
+			continue
+		}
+		seen[fp] = struct{}{}
+		decision.EvidenceHashes = append(decision.EvidenceHashes, fp)
+	}
+	sort.Strings(decision.EvidenceHashes)
+	return decision
+}
+
+func finishPreflight(req action.Request, decision action.Decision, findings []preflight.Finding, cfg preflightFlags) int {
+	return finishPreflightWithHook(req, decision, findings, cfg, nil)
+}
+
+func finishPreflightWithHook(req action.Request, decision action.Decision, findings []preflight.Finding, cfg preflightFlags, afterReceipt func(action.Decision) error) int {
+	decision, err := writePreflightReceipt(req, decision, cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "write preflight receipt: %v\n", err)
+		return 1
+	}
+	if afterReceipt != nil {
+		if err := afterReceipt(decision); err != nil {
+			fmt.Fprintf(os.Stderr, "record deploy idempotency: %v\n", err)
+			return 1
+		}
+	}
+	if cfg.JSONOut {
+		outputDecision := action.SanitizeForOutput(decision)
+		outputFindings := preflight.SanitizeFindingsForOutput(findings)
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		_ = enc.Encode(report)
-		return
-	case "markdown", "md":
-		fmt.Print(shadowreport.Markdown(report))
-		return
-	case "text", "":
+		_ = enc.Encode(struct {
+			action.Decision
+			Findings []preflight.Finding `json:"findings"`
+		}{Decision: outputDecision, Findings: outputFindings})
+	} else {
+		printPreflightDecision(action.SanitizeForOutput(decision), len(findings))
+	}
+	switch decision.Decision {
+	case action.DecisionBlock:
+		return 1
+	case action.DecisionRequireApproval:
+		return 3
 	default:
-		fmt.Fprintf(os.Stderr, "unknown shadow-report format %q; use text, markdown, or json\n", *format)
-		os.Exit(2)
+		return 0
 	}
+}
 
-	fmt.Printf("HubbleOps shadow report\n")
-	fmt.Printf("records=%d tool_events=%d total_action_decisions=%d\n", report.TotalRecords, report.ToolEvents, report.TotalActionDecisions)
-	fmt.Printf("would_block_decisions=%d blocked=%d duplicate_side_effect_decisions=%d no_progress_decisions=%d budget_decisions=%d\n",
-		report.WouldBlockDecisions, report.Blocked, report.DuplicateSideEffectDecisions, report.NoProgressDecisions, report.BudgetDecisions)
-	fmt.Printf("estimated_cost_saved_usd=%.6f\n", report.EstimatedCostSavedUSD)
-	fmt.Printf("unreviewed_decisions_count=%d recommended_review_sample=%d\n",
-		report.UnreviewedDecisionsCount, len(report.RecommendedReviewSample))
-	if report.RecommendedFirstPolicy != "" {
-		fmt.Printf("recommended_first_policy=%s\n", report.RecommendedFirstPolicy)
+func writePreflightReceipt(req action.Request, decision action.Decision, cfg preflightFlags) (action.Decision, error) {
+	anchor, err := anchorFromArg(cfg.AnchorPath)
+	if err != nil {
+		decision.ReceiptError = err.Error()
+		return decision, err
 	}
-	printCounts("top_tools_by_risky_decisions", report.TopToolsByRiskyDecisions)
-	printCounts("top_result_classes", report.TopResultClasses)
-	if len(report.RecommendedReviewSample) > 0 {
-		fmt.Printf("review_queue\n")
-		for _, item := range report.RecommendedReviewSample {
-			fmt.Printf("- decision_id=%s action_name=%s hubbleops_action=%s risk_class=%s result_class=%s estimated_cost_usd=%.6f estimated_risk=%s\n",
-				item.DecisionID, item.ActionName, item.HubbleOpsAction, item.RiskClass, item.ResultClass, item.EstimatedCostUSD, item.EstimatedRisk)
-			if item.Reason != "" {
-				fmt.Printf("  reason=%s\n", item.Reason)
-			}
-			if item.EvidenceSummary != "" {
-				fmt.Printf("  evidence_summary=%s\n", item.EvidenceSummary)
-			}
-			if item.ReviewCommand != "" {
-				fmt.Printf("  label_command=%s\n", item.ReviewCommand)
-			}
+	receiptSigner, receiptSecret, err := configurePreflightReceiptSigner(cfg)
+	if err != nil {
+		decision.ReceiptError = err.Error()
+		return decision, err
+	}
+	return actionreceipt.Write(req, decision, actionreceipt.Options{
+		WALDir:        cfg.WALDir,
+		ReceiptSecret: receiptSecret,
+		ReceiptKeyID:  cfg.ReceiptKeyID,
+		ReceiptSigner: receiptSigner,
+		Anchor:        anchor,
+	})
+}
+
+func configurePreflightReceiptSigner(cfg preflightFlags) (receipts.ReceiptSigner, string, error) {
+	mode := strings.ToLower(strings.TrimSpace(strings.ReplaceAll(cfg.ReceiptSigner, "_", "-")))
+	if mode == "" {
+		if strings.TrimSpace(cfg.ReceiptSecret) != "" {
+			mode = config.ReceiptSignerLocal
+		} else {
+			mode = config.ReceiptSignerNone
 		}
+	}
+	switch mode {
+	case config.ReceiptSignerNone:
+		return nil, "", nil
+	case config.ReceiptSignerLocal:
+		if strings.TrimSpace(cfg.ReceiptSecret) == "" {
+			return nil, "", nil
+		}
+		return receipts.NewLocalSecretSigner(cfg.ReceiptKeyID, []byte(cfg.ReceiptSecret)), cfg.ReceiptSecret, nil
+	case config.ReceiptSignerAWSKMS:
+		if strings.TrimSpace(cfg.ReceiptKMSKeyID) == "" {
+			return nil, "", fmt.Errorf("-receipt-kms-key-id is required when -receipt-signer=aws-kms")
+		}
+		if strings.TrimSpace(cfg.ReceiptKMSRegion) == "" {
+			return nil, "", fmt.Errorf("-receipt-kms-region or AWS_REGION is required when -receipt-signer=aws-kms")
+		}
+		client := &receipts.AwsKmsHTTPClient{
+			Region:          cfg.ReceiptKMSRegion,
+			Endpoint:        cfg.ReceiptKMSEndpoint,
+			AccessKeyID:     os.Getenv("AWS_ACCESS_KEY_ID"),
+			SecretAccessKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
+			SessionToken:    os.Getenv("AWS_SESSION_TOKEN"),
+			HTTPClient:      &http.Client{Timeout: 15 * time.Second},
+			Now:             time.Now,
+		}
+		return receipts.NewLazyAwsKmsSigner(cfg.ReceiptKeyID, cfg.ReceiptKMSKeyID, client), "", nil
+	case config.ReceiptSignerGCPKMS:
+		return receipts.NewGCPKMSSigner(cfg.ReceiptKeyID, cfg.ReceiptKMSKeyID), "", nil
+	case config.ReceiptSignerVaultTransit:
+		return receipts.NewVaultTransitSigner(cfg.ReceiptKeyID, cfg.ReceiptKMSKeyID), "", nil
+	default:
+		return nil, "", fmt.Errorf("unsupported receipt signer %q", cfg.ReceiptSigner)
+	}
+}
+
+func printPreflightDecision(decision action.Decision, findingCount int) {
+	fmt.Printf("HubbleOps preflight decision\n")
+	fmt.Printf("decision=%s risk_score=%d risk_class=%s findings=%d receipt_id=%s\n",
+		decision.Decision, decision.RiskScore, decision.RiskClass, findingCount, decision.ReceiptID)
+	fmt.Printf("reason=%s\n", decision.Reason)
+	if len(decision.RequiredApprovers) > 0 {
+		fmt.Printf("required_approvers=%s\n", strings.Join(decision.RequiredApprovers, ","))
+	}
+	if decision.ReceiptError != "" {
+		fmt.Printf("receipt_warning=%s\n", decision.ReceiptError)
 	}
 }
 
@@ -391,8 +776,8 @@ func runEvidencePack(args []string) {
 	sinceRaw := fs.String("since", "", "inclusive start day, YYYY-MM-DD")
 	untilRaw := fs.String("until", "", "exclusive end day, YYYY-MM-DD")
 	project := fs.String("project", "", "limit to a single project")
-	receiptPublicKey := fs.String("receipt-public-key", os.Getenv("HUBBLEOPS_RECEIPT_PUBLIC_KEY"), "base64 Ed25519 receipt public key; verifies signatures without the signing secret")
-	receiptSecret := fs.String("receipt-secret", os.Getenv("HUBBLEOPS_RECEIPT_SIGNING_SECRET"), "receipt signing secret (operator path)")
+	receiptPublicKey := fs.String("receipt-public-key", os.Getenv("HUBBLEOPS_RECEIPT_PUBLIC_KEY"), "base64 Ed25519 receipt public key")
+	receiptSecret := fs.String("receipt-secret", os.Getenv("HUBBLEOPS_RECEIPT_SIGNING_SECRET"), "receipt signing secret")
 	out := fs.String("out", "", "write the pack to this file instead of stdout")
 	_ = fs.Parse(args)
 
@@ -402,7 +787,7 @@ func runEvidencePack(args []string) {
 		ReceiptSecret:    *receiptSecret,
 	}
 	if *sinceRaw != "" {
-		since, err := parseExportSince(*sinceRaw)
+		since, err := parseDay(*sinceRaw)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "since: %v\n", err)
 			os.Exit(2)
@@ -410,16 +795,15 @@ func runEvidencePack(args []string) {
 		opts.Since = since
 	}
 	if *untilRaw != "" {
-		until, err := parseExportSince(*untilRaw)
+		until, err := parseDay(*untilRaw)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "until: %v\n", err)
 			os.Exit(2)
 		}
-		// --until is given as a day; make it inclusive of that whole day.
 		opts.Until = until.AddDate(0, 0, 1)
 	}
 
-	records, err := readShadowRecords(fs.Args())
+	records, err := readWALRecords(fs.Args())
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -440,56 +824,52 @@ func runEvidencePack(args []string) {
 		fmt.Fprintf(os.Stderr, "unknown evidence-pack format %q; use markdown or json\n", *format)
 		os.Exit(2)
 	}
-
-	if *out == "" {
-		fmt.Print(string(rendered))
-	} else {
-		w, closeFn, createErr := createExportOutput(*out)
-		if createErr != nil {
-			fmt.Fprintf(os.Stderr, "open %s: %v\n", *out, createErr)
-			os.Exit(1)
-		}
-		if _, writeErr := w.Write(rendered); writeErr != nil {
-			_ = closeFn()
-			fmt.Fprintf(os.Stderr, "write %s: %v\n", *out, writeErr)
-			os.Exit(1)
-		}
-		if closeErr := closeFn(); closeErr != nil {
-			fmt.Fprintf(os.Stderr, "close %s: %v\n", *out, closeErr)
-			os.Exit(1)
-		}
-		fmt.Fprintf(os.Stderr, "wrote evidence pack to %s\n", *out)
-	}
-
-	// Make integrity failures actionable: a non-verifying pack should not exit clean.
+	writeOutputOrExit(*out, rendered)
 	if !pack.Integrity.Verified {
 		os.Exit(1)
 	}
 }
 
-func runVerifyReceipts(args []string) {
+func runVerifyReceipts(args []string) int {
 	fs := flag.NewFlagSet("verify-receipts", flag.ExitOnError)
 	jsonOut := fs.Bool("json", false, "print JSON")
-	receiptSecret := fs.String("receipt-secret", os.Getenv("HUBBLEOPS_RECEIPT_SIGNING_SECRET"), "receipt signing secret; defaults to HUBBLEOPS_RECEIPT_SIGNING_SECRET")
-	receiptPublicKey := fs.String("receipt-public-key", os.Getenv("HUBBLEOPS_RECEIPT_PUBLIC_KEY"), "base64 Ed25519 receipt public key; verify receipts without the signing secret")
+	receiptSecret := fs.String("receipt-secret", receiptSecretFromEnv(), "receipt signing secret")
+	receiptPublicKey := fs.String("receipt-public-key", os.Getenv("HUBBLEOPS_RECEIPT_PUBLIC_KEY"), "base64 Ed25519 receipt public key")
+	receiptPublicKeys := fs.String("receipt-public-keys", os.Getenv("HUBBLEOPS_RECEIPT_PUBLIC_KEYS"), "comma-separated key_id=base64 public keys to verify across key rotation")
 	requireSignatures := fs.Bool("require-signatures", false, "fail verification if any action receipt is unsigned")
+	anchorRaw := fs.String("anchor", "", "checkpoint anchor path, file:// URL, or s3:// URL")
+	legacy := fs.Bool("legacy", false, "allow legacy records without seq when no anchor is supplied")
 	_ = fs.Parse(args)
-	if *requireSignatures && *receiptSecret == "" && *receiptPublicKey == "" {
-		fmt.Fprintln(os.Stderr, "-require-signatures needs -receipt-public-key (or -receipt-secret / HUBBLEOPS_RECEIPT_SIGNING_SECRET)")
-		os.Exit(1)
+	keySet := parseKeyPairs(*receiptPublicKeys)
+	if *requireSignatures && *receiptSecret == "" && *receiptPublicKey == "" && len(keySet) == 0 {
+		fmt.Fprintln(os.Stderr, "-require-signatures needs -receipt-public-key(s) or -receipt-secret")
+		return 1
 	}
-
-	records, err := readShadowRecords(fs.Args())
+	anchor, err := anchorFromArg(*anchorRaw)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return 1
 	}
-	report := receiptverify.VerifyWithOptions(records, receiptverify.Options{
+
+	// Stream the WAL one record at a time so verification stays O(1) in memory regardless of
+	// how large the log is.
+	verifier, err := receiptverify.NewVerifier(receiptverify.Options{
 		ReceiptSecret:     *receiptSecret,
 		ReceiptPublicKey:  *receiptPublicKey,
+		ReceiptPublicKeys: keySet,
 		RequireSignatures: *requireSignatures,
+		Legacy:            *legacy,
+		Anchor:            anchor,
 	})
-
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if err := streamWALInto(verifier, fs.Args()); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	report := verifier.Report()
 	if *jsonOut {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -498,138 +878,79 @@ func runVerifyReceipts(args []string) {
 		fmt.Printf("HubbleOps receipt verify\n")
 		fmt.Printf("records=%d action_receipts=%d signed_receipts=%d unsigned_receipts=%d verified=%t\n",
 			report.TotalRecords, report.ActionReceipts, report.SignedReceipts, report.UnsignedReceipts, report.Verified)
-		fmt.Printf("missing_hashes=%d hash_mismatches=%d signature_mismatches=%d chain_broken_at=%d receipt_field_gaps=%d\n",
-			report.MissingHashes, report.HashMismatches, report.SignatureMismatches, report.ChainBrokenAt, report.ReceiptFieldGaps)
+		fmt.Printf("missing_hashes=%d hash_mismatches=%d signature_mismatches=%d chain_broken_at=%d receipt_field_gaps=%d missing_seq=%d seq_gaps=%d anchor_mismatches=%d anchor_signature_mismatches=%d max_seq=%d\n",
+			report.MissingHashes, report.HashMismatches, report.SignatureMismatches, report.ChainBrokenAt, report.ReceiptFieldGaps,
+			report.MissingSeq, report.SeqGaps, report.AnchorMismatches, report.AnchorSignatureMismatches, report.MaxSeq)
 		if report.LastRecordHash != "" {
 			fmt.Printf("last_record_hash=%s\n", report.LastRecordHash)
 		}
-		if report.FirstGapDecisionID != "" {
-			fmt.Printf("first_gap_decision_id=%s\n", report.FirstGapDecisionID)
-		}
-		if report.FirstSignatureMismatchDecisionID != "" {
-			fmt.Printf("first_signature_mismatch_decision_id=%s\n", report.FirstSignatureMismatchDecisionID)
+		if report.AnchorSeq != 0 {
+			fmt.Printf("anchor_seq=%d anchor_head_hash=%s\n", report.AnchorSeq, report.AnchorHeadHash)
 		}
 		if report.Recommendation != "" {
 			fmt.Printf("recommendation=%s\n", report.Recommendation)
 		}
 	}
-
 	if !report.Verified {
-		os.Exit(1)
+		return 1
+	}
+	return 0
+}
+
+func anchorFromArg(raw string) (wal.Anchor, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	switch {
+	case raw == "stdout" || raw == "stdout://":
+		return wal.StdoutAnchor{}, nil
+	case strings.HasPrefix(raw, "file://"):
+		return wal.NewFileAnchor(strings.TrimPrefix(raw, "file://")), nil
+	case strings.HasPrefix(raw, "s3://"):
+		return wal.NewS3ObjectLockAnchor(raw)
+	default:
+		return wal.NewFileAnchor(raw), nil
 	}
 }
 
-func runEval(args []string) {
-	fs := flag.NewFlagSet("eval", flag.ExitOnError)
-	jsonOut := fs.Bool("json", false, "print JSON")
-	assertMode := fs.Bool("assert", false, "exit non-zero if quality gates fail")
-	anonymizeOut := fs.String("anonymize-out", "", "write privacy-safe JSONL copy")
-	salt := fs.String("salt", os.Getenv("HUBBLEOPS_ANON_SALT"), "salt for anonymized IDs")
-	maxFP := fs.Float64("max-fp-block-rate", 0, "maximum false positive block rate")
-	maxMiss := fs.Float64("max-missed-runaway-rate", 0, "maximum missed runaway rate")
-	minRecall := fs.Float64("min-runaway-recall", 1, "minimum runaway recall")
-	minPrecision := fs.Float64("min-block-precision", 1, "minimum block precision")
-	maxP95 := fs.Float64("max-p95-ms", 25, "maximum replay p95 decision latency in ms")
-	_ = fs.Parse(args)
-
-	events, err := readEvalEvents(fs.Args())
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-	if len(events) == 0 {
-		fmt.Fprintln(os.Stderr, "no trace events found")
-		os.Exit(1)
-	}
-
-	if *anonymizeOut != "" {
-		if *salt == "" {
-			fmt.Fprintln(os.Stderr, "-salt or HUBBLEOPS_ANON_SALT is required with -anonymize-out")
-			os.Exit(1)
-		}
-		f, err := os.Create(*anonymizeOut)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "create anonymized output: %v\n", err)
-			os.Exit(1)
-		}
-		if err := loopeval.WriteJSONL(f, loopeval.Anonymize(events, *salt)); err != nil {
-			_ = f.Close()
-			fmt.Fprintf(os.Stderr, "write anonymized output: %v\n", err)
-			os.Exit(1)
-		}
-		if err := f.Close(); err != nil {
-			fmt.Fprintf(os.Stderr, "close anonymized output: %v\n", err)
-			os.Exit(1)
-		}
-	}
-
-	report := loopeval.Evaluate(events, loop.DefaultConfig(), loopeval.GateConfig{
-		MaxFalsePositiveBlockRate: *maxFP,
-		MaxMissedRunawayRate:      *maxMiss,
-		MinRunawayRecall:          *minRecall,
-		MinBlockPrecision:         *minPrecision,
-		MaxP95DecisionMs:          *maxP95,
-	})
-
-	if *jsonOut {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		_ = enc.Encode(report)
-	} else {
-		fmt.Printf("HubbleOps loop eval\n")
-		fmt.Printf("traces=%d events=%d runaways=%d legit=%d\n", report.TotalTraces, report.TotalEvents, report.RunawayTraces, report.LegitTraces)
-		fmt.Printf("recall=%.4f precision=%.4f fp_block_rate=%.4f missed_runaway_rate=%.4f\n",
-			report.RunawayRecall, report.BlockPrecision, report.FalsePositiveBlockRate, report.MissedRunawayRate)
-		fmt.Printf("cost_total_usd=%.4f saved_cost_usd=%.4f replay_p95_decision_ms=%.4f\n",
-			report.TotalCostUSD, report.SavedCostUSD, report.ReplayP95DecisionLatencyMs)
-		for _, failure := range report.GateFailures {
-			fmt.Printf("[fail] %s\n", failure)
-		}
-	}
-
-	if *assertMode && len(report.GateFailures) > 0 {
-		os.Exit(1)
-	}
-}
-
-func readEvalEvents(paths []string) ([]loopeval.Event, error) {
+// streamWALInto feeds WAL files (or stdin) through the verifier one record at a time, never
+// materializing the whole log in memory.
+func streamWALInto(v *receiptverify.Verifier, paths []string) error {
 	if len(paths) == 0 {
-		return loopeval.ReadJSONL(os.Stdin, "stdin")
+		return v.AddStream(os.Stdin)
 	}
-	var out []loopeval.Event
 	for _, path := range paths {
 		f, err := os.Open(path)
 		if err != nil {
-			return nil, fmt.Errorf("open %s: %w", path, err)
+			return fmt.Errorf("open %s: %w", path, err)
 		}
-		events, readErr := loopeval.ReadJSONL(f, path)
+		readErr := v.AddStream(f)
 		closeErr := f.Close()
 		if readErr != nil {
-			return nil, readErr
+			return fmt.Errorf("read %s: %w", path, readErr)
 		}
 		if closeErr != nil {
-			return nil, fmt.Errorf("close %s: %w", path, closeErr)
+			return fmt.Errorf("close %s: %w", path, closeErr)
 		}
-		out = append(out, events...)
 	}
-	return out, nil
+	return nil
 }
 
-func readShadowRecords(paths []string) ([]walRecord, error) {
+func readWALRecords(paths []string) ([]wal.Record, error) {
 	if len(paths) == 0 {
-		records, err := shadowreport.ReadJSONL(os.Stdin)
-		return records, err
+		return decodeRecords(os.Stdin)
 	}
-	var out []walRecord
+	var out []wal.Record
 	for _, path := range paths {
 		f, err := os.Open(path)
 		if err != nil {
 			return nil, fmt.Errorf("open %s: %w", path, err)
 		}
-		records, readErr := shadowreport.ReadJSONL(f)
+		records, readErr := decodeRecords(f)
 		closeErr := f.Close()
 		if readErr != nil {
-			return nil, readErr
+			return nil, fmt.Errorf("read %s: %w", path, readErr)
 		}
 		if closeErr != nil {
 			return nil, fmt.Errorf("close %s: %w", path, closeErr)
@@ -639,27 +960,184 @@ func readShadowRecords(paths []string) ([]walRecord, error) {
 	return out, nil
 }
 
-type walRecord = shadowreport.WALRecord
+func decodeRecords(r io.Reader) ([]wal.Record, error) {
+	dec := json.NewDecoder(r)
+	var records []wal.Record
+	for {
+		var rec wal.Record
+		if err := dec.Decode(&rec); err != nil {
+			if err == io.EOF {
+				return records, nil
+			}
+			return nil, err
+		}
+		records = append(records, rec)
+	}
+}
 
-func printCounts(label string, counts []shadowreport.Count) {
-	if len(counts) == 0 {
+func loadPolicy(path string) (*policy.Policy, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil, nil
+	}
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return nil, nil
+	}
+	return policy.Load(path)
+}
+
+func defaultPolicyPath() string {
+	if value := strings.TrimSpace(os.Getenv("HUBBLEOPS_POLICY")); value != "" {
+		return value
+	}
+	if _, err := os.Stat(filepath.Join("configs", "policy.yaml")); err == nil {
+		return filepath.Join("configs", "policy.yaml")
+	}
+	if _, err := os.Stat(filepath.Join("configs", "policy.yaml.example")); err == nil {
+		return filepath.Join("configs", "policy.yaml.example")
+	}
+	return ""
+}
+
+func parseDay(raw string) (time.Time, error) {
+	t, err := time.Parse("2006-01-02", strings.TrimSpace(raw))
+	if err != nil {
+		return time.Time{}, fmt.Errorf("use YYYY-MM-DD: %w", err)
+	}
+	return t.UTC(), nil
+}
+
+func writeOutputOrExit(path string, data []byte) {
+	if path == "" {
+		fmt.Print(string(data))
 		return
 	}
-	fmt.Printf("%s:\n", label)
-	for _, count := range counts {
-		fmt.Printf("- %s=%d\n", count.Name, count.Count)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		fmt.Fprintf(os.Stderr, "write %s: %v\n", path, err)
+		os.Exit(1)
+	}
+}
+
+func normalizeEnvironment(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "prod":
+		return "production"
+	case "dev":
+		return "development"
+	case "":
+		return "unknown"
+	default:
+		return strings.ToLower(strings.TrimSpace(value))
 	}
 }
 
 func envOrDefault(names []string, fallback string) string {
 	for _, name := range names {
-		if value := os.Getenv(name); value != "" {
+		if value := strings.TrimSpace(os.Getenv(name)); value != "" {
 			return value
 		}
 	}
 	return fallback
 }
 
+// receiptSecretFromEnv prefers a secret file over an inline env value so the signing secret
+// need not appear on the command line.
+func receiptSecretFromEnv() string {
+	if s := strings.TrimSpace(os.Getenv("HUBBLEOPS_RECEIPT_SIGNING_SECRET")); s != "" {
+		return s
+	}
+	if path := strings.TrimSpace(os.Getenv("HUBBLEOPS_RECEIPT_SIGNING_SECRET_FILE")); path != "" {
+		if data, err := os.ReadFile(path); err == nil {
+			return strings.TrimSpace(string(data))
+		}
+	}
+	return ""
+}
+
+// parseKeyPairs parses "key_id=base64,key_id2=base64" into a map for rotation verification.
+func parseKeyPairs(raw string) map[string]string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	out := map[string]string{}
+	for _, pair := range strings.Split(raw, ",") {
+		kid, encoded, ok := strings.Cut(strings.TrimSpace(pair), "=")
+		if !ok {
+			continue
+		}
+		if kid = strings.TrimSpace(kid); kid != "" {
+			out[kid] = strings.TrimSpace(encoded)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func envIntOrDefault(name string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		return fallback
+	}
+	return parsed
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: hubbleops demo|doctor|eval|shadow-report|evidence-pack|verify-receipts|review-decision|export-outcomes [flags]")
+	fmt.Fprintln(os.Stderr, "usage: hubbleops preflight|policy|demo|evidence-pack|verify-receipts [flags]")
+}
+
+func preflightUsage() {
+	fmt.Fprintln(os.Stderr, "usage: hubbleops preflight terraform|migration|deploy [flags] <input>")
+}
+
+func policyUsage() {
+	fmt.Fprintln(os.Stderr, "usage: hubbleops policy validate <policy.yaml>")
+}
+
+func flagsFirst(fs *flag.FlagSet, args []string) []string {
+	var flags []string
+	var positional []string
+	// Bool flags never consume the next argument. Derive them from the FlagSet
+	// so newly registered bool flags cannot silently desync the reordering.
+	boolFlags := map[string]struct{}{}
+	fs.VisitAll(func(f *flag.Flag) {
+		if b, ok := f.Value.(interface{ IsBoolFlag() bool }); ok && b.IsBoolFlag() {
+			boolFlags[f.Name] = struct{}{}
+		}
+	})
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if !strings.HasPrefix(arg, "-") || arg == "-" {
+			positional = append(positional, arg)
+			continue
+		}
+		flags = append(flags, arg)
+		name := strings.TrimLeft(arg, "-")
+		if idx := strings.Index(name, "="); idx >= 0 {
+			name = name[:idx]
+		}
+		if _, ok := boolFlags[name]; ok || strings.Contains(arg, "=") {
+			continue
+		}
+		if i+1 < len(args) {
+			i++
+			flags = append(flags, args[i])
+		}
+	}
+	return append(flags, positional...)
 }
