@@ -393,7 +393,7 @@ func newPreflightFlagSet(name string) (*flag.FlagSet, *preflightFlags) {
 	fs.IntVar(&cfg.DuplicateWindowSeconds, "duplicate-window-seconds", envIntOrDefault("HUBBLEOPS_DUPLICATE_WINDOW_SECONDS", 7*24*60*60), "deploy duplicate window in seconds")
 	fs.StringVar(&cfg.ReceiptSecret, "receipt-secret", receiptSecretFromEnv(), "receipt signing secret")
 	fs.StringVar(&cfg.ReceiptKeyID, "receipt-key-id", envOrDefault([]string{"HUBBLEOPS_RECEIPT_KEY_ID"}, "local"), "receipt key id")
-	fs.StringVar(&cfg.ReceiptSigner, "receipt-signer", envOrDefault([]string{"HUBBLEOPS_RECEIPT_SIGNER"}, ""), "receipt signer: none, local, aws-kms, gcp-kms, vault-transit")
+	fs.StringVar(&cfg.ReceiptSigner, "receipt-signer", envOrDefault([]string{"HUBBLEOPS_RECEIPT_SIGNER"}, ""), "receipt signer: none, local, aws-kms (gcp-kms and vault-transit are planned, not yet implemented)")
 	fs.StringVar(&cfg.ReceiptKMSKeyID, "receipt-kms-key-id", envOrDefault([]string{"HUBBLEOPS_RECEIPT_KMS_KEY_ID"}, ""), "AWS KMS asymmetric key id/arn for receipt signing")
 	fs.StringVar(&cfg.ReceiptKMSRegion, "receipt-kms-region", envOrDefault([]string{"HUBBLEOPS_RECEIPT_KMS_REGION", "AWS_REGION", "AWS_DEFAULT_REGION"}, ""), "AWS KMS region for receipt signing")
 	fs.StringVar(&cfg.ReceiptKMSEndpoint, "receipt-kms-endpoint", envOrDefault([]string{"HUBBLEOPS_RECEIPT_KMS_ENDPOINT"}, ""), "optional AWS KMS endpoint override")
@@ -418,6 +418,11 @@ func parsePreflightFlags(fs *flag.FlagSet, args []string) (int, bool) {
 }
 
 func validatePreflightIdentifiers(cfg preflightFlags) error {
+	// Reject reserved-but-stubbed signers before any scan or receipt work, so a
+	// misconfigured run is a usage error rather than a per-run runtime failure.
+	if err := config.CheckReceiptSignerImplemented(cfg.ReceiptSigner); err != nil {
+		return err
+	}
 	if strings.TrimSpace(cfg.Project) == "" {
 		return fmt.Errorf("-project is required")
 	}
@@ -715,6 +720,9 @@ func writePreflightReceipt(req action.Request, decision action.Decision, cfg pre
 }
 
 func configurePreflightReceiptSigner(cfg preflightFlags) (receipts.ReceiptSigner, string, error) {
+	if err := config.CheckReceiptSignerImplemented(cfg.ReceiptSigner); err != nil {
+		return nil, "", err
+	}
 	mode := strings.ToLower(strings.TrimSpace(strings.ReplaceAll(cfg.ReceiptSigner, "_", "-")))
 	if mode == "" {
 		if strings.TrimSpace(cfg.ReceiptSecret) != "" {
@@ -748,10 +756,6 @@ func configurePreflightReceiptSigner(cfg preflightFlags) (receipts.ReceiptSigner
 			Now:             time.Now,
 		}
 		return receipts.NewLazyAwsKmsSigner(cfg.ReceiptKeyID, cfg.ReceiptKMSKeyID, client), "", nil
-	case config.ReceiptSignerGCPKMS:
-		return receipts.NewGCPKMSSigner(cfg.ReceiptKeyID, cfg.ReceiptKMSKeyID), "", nil
-	case config.ReceiptSignerVaultTransit:
-		return receipts.NewVaultTransitSigner(cfg.ReceiptKeyID, cfg.ReceiptKMSKeyID), "", nil
 	default:
 		return nil, "", fmt.Errorf("unsupported receipt signer %q", cfg.ReceiptSigner)
 	}

@@ -37,6 +37,30 @@ func TestGateStartupUnknownFlagPrintsUsageToStderr(t *testing.T) {
 	}
 }
 
+// TestGateStartupRejectsUnimplementedSigner: gcp-kms and vault-transit are
+// stubs whose SignRecord fails on every write. Configuring one must refuse to
+// start with a clear error instead of failing at runtime per receipt.
+func TestGateStartupRejectsUnimplementedSigner(t *testing.T) {
+	for _, signer := range []string{"gcp-kms", "vault-transit"} {
+		t.Run(signer, func(t *testing.T) {
+			clearGateStartupEnv(t)
+			// dev is where the stub previously slipped past config.Validate and
+			// failed at runtime on every receipt write.
+			t.Setenv("HUBBLEOPS_ENV", "dev")
+			t.Setenv("HUBBLEOPS_AUTH_ENABLED", "false")
+			t.Setenv("HUBBLEOPS_WAL_DIR", t.TempDir())
+
+			_, err := newGateRuntime([]string{"-policy=", "-approval-store=", "-receipt-signer", signer})
+			if err == nil {
+				t.Fatalf("newGateRuntime succeeded with stub signer %q, want configuration error", signer)
+			}
+			if !strings.Contains(err.Error(), signer) || !strings.Contains(err.Error(), "not yet implemented") {
+				t.Fatalf("error %q must name %q and say it is not yet implemented", err.Error(), signer)
+			}
+		})
+	}
+}
+
 func TestGateStartupRejectsProdAuthDisabled(t *testing.T) {
 	clearGateStartupEnv(t)
 	t.Setenv("HUBBLEOPS_ENV", "prod")

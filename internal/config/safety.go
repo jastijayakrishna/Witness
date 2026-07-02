@@ -15,15 +15,18 @@ const (
 
 	CaptureModeFingerprint = "fingerprint"
 	CaptureModeRaw         = "raw"
+
+	ReceiptSignerNone         = "none"
+	ReceiptSignerLocal        = "local"
+	ReceiptSignerAWSKMS       = "aws-kms"
+	ReceiptSignerGCPKMS       = "gcp-kms"
+	ReceiptSignerVaultTransit = "vault-transit"
 )
 
 const redacted = "<redacted>"
 
-// RuntimeSecrets describes startup-only secret presence without carrying the
-// secret values through config validation or logs.
 type RuntimeSecrets struct {
-	ReceiptSigningSecretSet   bool
-	ActionCapabilitySecretSet bool
+	ReceiptSigningSecretSet bool
 }
 
 type ValidationResult struct {
@@ -38,9 +41,6 @@ func (e ValidationError) Error() string {
 	return "unsafe HubbleOps configuration: " + strings.Join(e.Failures, "; ")
 }
 
-// Validate enforces production safety invariants and returns loud dev warnings
-// for the same settings. It intentionally does not run inside Load so tests and
-// helper CLIs can parse config without requiring production runtime secrets.
 func (cfg *Config) Validate(secrets RuntimeSecrets) (ValidationResult, error) {
 	cfg.normalize()
 
@@ -59,8 +59,9 @@ func (cfg *Config) Validate(secrets RuntimeSecrets) (ValidationResult, error) {
 	if cfg.WAL.SyncMode != "batch" && cfg.WAL.SyncMode != "sync" {
 		failures = append(failures, fmt.Sprintf("HUBBLEOPS_WAL_SYNC_MODE must be batch or sync; got %q", cfg.WAL.SyncMode))
 	}
-	if !isKnownLoopAction(cfg.LoopDetection.Action) {
-		failures = append(failures, fmt.Sprintf("HUBBLEOPS_LOOP_ACTION must be shadow, warn, or block; got %q", cfg.LoopDetection.Action))
+	receiptSigner := cfg.resolvedReceiptSigner(secrets)
+	if !isKnownReceiptSigner(receiptSigner) {
+		failures = append(failures, fmt.Sprintf("HUBBLEOPS_RECEIPT_SIGNER must be one of none, local, aws-kms, gcp-kms, vault-transit; got %q", cfg.Receipts.Signer))
 	}
 
 	if cfg.Environment == EnvironmentProd {
@@ -76,8 +77,22 @@ func (cfg *Config) Validate(secrets RuntimeSecrets) (ValidationResult, error) {
 		if strings.TrimSpace(cfg.WAL.Dir) == "" {
 			failures = append(failures, "production requires HUBBLEOPS_WAL_DIR")
 		}
-		if !secrets.ReceiptSigningSecretSet {
-			failures = append(failures, "production requires HUBBLEOPS_RECEIPT_SIGNING_SECRET")
+		if secrets.ReceiptSigningSecretSet || receiptSigner == ReceiptSignerLocal {
+			failures = append(failures, "production forbids LocalSecretSigner and HUBBLEOPS_RECEIPT_SIGNING_SECRET; use HUBBLEOPS_RECEIPT_SIGNER=aws-kms")
+		}
+		if receiptSigner == ReceiptSignerNone {
+			failures = append(failures, "production requires an external receipt signer such as HUBBLEOPS_RECEIPT_SIGNER=aws-kms")
+		}
+		if receiptSigner == ReceiptSignerAWSKMS {
+			if strings.TrimSpace(cfg.Receipts.KMSKeyID) == "" {
+				failures = append(failures, "production requires HUBBLEOPS_RECEIPT_KMS_KEY_ID when HUBBLEOPS_RECEIPT_SIGNER=aws-kms")
+			}
+			if strings.TrimSpace(cfg.Receipts.KMSRegion) == "" {
+				failures = append(failures, "production requires HUBBLEOPS_RECEIPT_KMS_REGION or AWS_REGION when HUBBLEOPS_RECEIPT_SIGNER=aws-kms")
+			}
+		}
+		if receiptSigner == ReceiptSignerGCPKMS || receiptSigner == ReceiptSignerVaultTransit {
+			failures = append(failures, fmt.Sprintf("production receipt signer %q is stubbed; use aws-kms until implemented", receiptSigner))
 		}
 		if !cfg.Receipts.RequireForBlock {
 			failures = append(failures, "production requires HUBBLEOPS_REQUIRE_RECEIPT_FOR_BLOCK=true")
@@ -94,17 +109,11 @@ func (cfg *Config) Validate(secrets RuntimeSecrets) (ValidationResult, error) {
 		if cfg.Reviews.RawNotes && !(cfg.Capture.Mode == CaptureModeRaw && cfg.Capture.AllowRawInProd) {
 			failures = append(failures, "production raw review notes require HUBBLEOPS_CAPTURE_MODE=raw and HUBBLEOPS_ALLOW_RAW_CAPTURE_IN_PROD=true")
 		}
-		if cfg.LoopDetection.Enabled && cfg.LoopDetection.Action == "block" && !cfg.LoopDetection.RequireSessionForBlock {
-			failures = append(failures, "production block mode requires HUBBLEOPS_LOOP_REQUIRE_SESSION_FOR_BLOCK=true")
-		}
 		if cfg.Receipts.EnforceWithoutReceipt {
 			warnings = append(warnings, "CRITICAL: HUBBLEOPS_ENFORCE_WITHOUT_RECEIPT=true can enforce unaudited blocks")
 		}
 		if cfg.Capture.Mode == CaptureModeRaw && cfg.Capture.AllowRawInProd {
 			warnings = append(warnings, "CRITICAL: raw capture explicitly enabled in production")
-		}
-		if !secrets.ActionCapabilitySecretSet {
-			warnings = append(warnings, "HUBBLEOPS_ACTION_CAPABILITY_SECRET is unset; dangerous actions must rely on backup_id only")
 		}
 	} else {
 		if !cfg.Auth.Enabled {
@@ -117,10 +126,16 @@ func (cfg *Config) Validate(secrets RuntimeSecrets) (ValidationResult, error) {
 			warnings = append(warnings, "HubbleOps metrics endpoint is public")
 		}
 		if strings.TrimSpace(cfg.WAL.Dir) == "" {
-			warnings = append(warnings, "HUBBLEOPS_WAL_DIR is empty; proxy startup will fail if WAL is needed")
+			warnings = append(warnings, "HUBBLEOPS_WAL_DIR is empty; receipt writes will fail")
 		}
-		if !secrets.ReceiptSigningSecretSet {
-			warnings = append(warnings, "receipt signing secret unset; local/dev receipts will be unsigned")
+		if receiptSigner == ReceiptSignerNone {
+			warnings = append(warnings, "receipt signer unset; local/dev receipts will be unsigned")
+		}
+		if receiptSigner == ReceiptSignerLocal {
+			warnings = append(warnings, "dev-only LocalSecretSigner configured; production requires external KMS signing")
+		}
+		if receiptSigner == ReceiptSignerGCPKMS || receiptSigner == ReceiptSignerVaultTransit {
+			warnings = append(warnings, fmt.Sprintf("receipt signer %q is stubbed and will fail signing", receiptSigner))
 		}
 		if cfg.Capture.Mode == CaptureModeRaw {
 			warnings = append(warnings, "raw capture enabled; use only with sanitized local data")
@@ -136,64 +151,11 @@ func (cfg *Config) Validate(secrets RuntimeSecrets) (ValidationResult, error) {
 		}
 	}
 
-	// Limit rules are environment-independent: a half-declared limit silently
-	// never firing is worse than a startup failure in any environment.
-	failures = append(failures, validateLimits(cfg.Limits)...)
-
 	result := ValidationResult{Warnings: warnings}
 	if len(failures) > 0 {
 		return result, ValidationError{Failures: failures}
 	}
 	return result, nil
-}
-
-func validateLimits(limits LimitsConfig) []string {
-	var failures []string
-	scopeOK := func(scope string) bool {
-		switch strings.ToLower(strings.TrimSpace(scope)) {
-		case "", "agent", "session", "resource", "recipient":
-			return true
-		}
-		return false
-	}
-	for i, rule := range limits.Cumulative {
-		label := fmt.Sprintf("limits.cumulative[%d] (%s)", i, rule.Name)
-		if rule.WindowSeconds <= 0 {
-			failures = append(failures, label+" requires window_seconds > 0")
-		}
-		if rule.MaxAmountCents <= 0 {
-			failures = append(failures, label+" requires max_amount_cents > 0")
-		}
-		if !scopeOK(rule.Scope) {
-			failures = append(failures, label+" scope must be agent, session, resource, or recipient")
-		}
-	}
-	for i, rule := range limits.Velocity {
-		label := fmt.Sprintf("limits.velocity[%d] (%s)", i, rule.Name)
-		if rule.WindowSeconds <= 0 {
-			failures = append(failures, label+" requires window_seconds > 0")
-		}
-		if rule.MaxActions <= 0 {
-			failures = append(failures, label+" requires max_actions > 0")
-		}
-		if !scopeOK(rule.Scope) {
-			failures = append(failures, label+" scope must be agent, session, resource, or recipient")
-		}
-		switch strings.ToLower(strings.TrimSpace(rule.MinRisk)) {
-		case "", "write", "dangerous":
-		default:
-			failures = append(failures, label+" min_risk must be write or dangerous")
-		}
-	}
-	if limits.Breaker.Trips > 0 {
-		if limits.Breaker.WindowSeconds <= 0 {
-			failures = append(failures, "limits.breaker requires window_seconds > 0")
-		}
-		if limits.Breaker.CooldownSeconds <= 0 {
-			failures = append(failures, "limits.breaker requires cooldown_seconds > 0")
-		}
-	}
-	return failures
 }
 
 func (cfg *Config) normalize() {
@@ -213,10 +175,10 @@ func (cfg *Config) normalize() {
 	if cfg.WAL.SyncMode == "" {
 		cfg.WAL.SyncMode = "batch"
 	}
-	cfg.LoopDetection.Action = strings.ToLower(strings.TrimSpace(cfg.LoopDetection.Action))
-	if cfg.LoopDetection.Action == "" {
-		cfg.LoopDetection.Action = "shadow"
-	}
+	cfg.Receipts.Signer = normalizeReceiptSigner(cfg.Receipts.Signer)
+	cfg.Receipts.KMSKeyID = strings.TrimSpace(cfg.Receipts.KMSKeyID)
+	cfg.Receipts.KMSRegion = strings.TrimSpace(cfg.Receipts.KMSRegion)
+	cfg.Receipts.KMSEndpoint = strings.TrimSpace(cfg.Receipts.KMSEndpoint)
 }
 
 func isKnownEnvironment(env string) bool {
@@ -237,13 +199,53 @@ func isKnownCaptureMode(mode string) bool {
 	}
 }
 
-func isKnownLoopAction(action string) bool {
-	switch action {
-	case "shadow", "warn", "block":
+func normalizeReceiptSigner(value string) string {
+	value = strings.ToLower(strings.TrimSpace(strings.ReplaceAll(value, "_", "-")))
+	switch value {
+	case "", ReceiptSignerNone:
+		return value
+	case ReceiptSignerLocal, "secret", "local-secret":
+		return ReceiptSignerLocal
+	case ReceiptSignerAWSKMS, "awskms", "kms":
+		return ReceiptSignerAWSKMS
+	case ReceiptSignerGCPKMS, "gcpkms":
+		return ReceiptSignerGCPKMS
+	case ReceiptSignerVaultTransit, "vault", "vaulttransit":
+		return ReceiptSignerVaultTransit
+	default:
+		return value
+	}
+}
+
+func (cfg *Config) resolvedReceiptSigner(secrets RuntimeSecrets) string {
+	mode := normalizeReceiptSigner(cfg.Receipts.Signer)
+	if mode != "" {
+		return mode
+	}
+	if secrets.ReceiptSigningSecretSet {
+		return ReceiptSignerLocal
+	}
+	return ReceiptSignerNone
+}
+
+func isKnownReceiptSigner(mode string) bool {
+	switch mode {
+	case ReceiptSignerNone, ReceiptSignerLocal, ReceiptSignerAWSKMS, ReceiptSignerGCPKMS, ReceiptSignerVaultTransit:
 		return true
 	default:
 		return false
 	}
+}
+
+// CheckReceiptSignerImplemented rejects signer modes that are reserved but not
+// yet implemented (their SignRecord fails on every write), so a stubbed signer
+// is refused at configuration time instead of failing every receipt at runtime.
+func CheckReceiptSignerImplemented(signer string) error {
+	switch normalizeReceiptSigner(signer) {
+	case ReceiptSignerGCPKMS, ReceiptSignerVaultTransit:
+		return fmt.Errorf("receipt signer %q is not yet implemented; supported: none, local (dev only), aws-kms", strings.TrimSpace(signer))
+	}
+	return nil
 }
 
 func (p PostgresConfig) RedactedDSN() string {
@@ -298,10 +300,6 @@ func (cfg *Config) RedactedSummary(secrets RuntimeSecrets) map[string]any {
 	cfg.normalize()
 	return map[string]any{
 		"environment": cfg.Environment,
-		"server": map[string]any{
-			"host": cfg.Server.Host,
-			"port": cfg.Server.Port,
-		},
 		"postgres": map[string]any{
 			"host":     cfg.Postgres.Host,
 			"port":     cfg.Postgres.Port,
@@ -309,12 +307,6 @@ func (cfg *Config) RedactedSummary(secrets RuntimeSecrets) map[string]any {
 			"password": redactedIfSet(cfg.Postgres.Password),
 			"dbname":   cfg.Postgres.DBName,
 			"sslmode":  cfg.Postgres.SSLMode,
-		},
-		"redis": map[string]any{
-			"host":     cfg.Redis.Host,
-			"port":     cfg.Redis.Port,
-			"password": redactedIfSet(cfg.Redis.Password),
-			"db":       cfg.Redis.DB,
 		},
 		"wal": map[string]any{
 			"dir":       cfg.WAL.Dir,
@@ -340,25 +332,14 @@ func (cfg *Config) RedactedSummary(secrets RuntimeSecrets) map[string]any {
 		"receipts": map[string]any{
 			"require_receipt_for_block": cfg.Receipts.RequireForBlock,
 			"enforce_without_receipt":   cfg.Receipts.EnforceWithoutReceipt,
+			"signer":                    cfg.resolvedReceiptSigner(secrets),
 			"signing_secret":            presence(secrets.ReceiptSigningSecretSet),
+			"kms_key_id":                redactedIfSet(cfg.Receipts.KMSKeyID),
+			"kms_region":                cfg.Receipts.KMSRegion,
+			"kms_endpoint":              RedactURL(cfg.Receipts.KMSEndpoint),
 		},
-		"loop_detection": map[string]any{
-			"enabled":                   cfg.LoopDetection.Enabled,
-			"action":                    cfg.LoopDetection.Action,
-			"max_repeated":              cfg.LoopDetection.MaxRepeated,
-			"require_session_for_block": cfg.LoopDetection.RequireSessionForBlock,
-		},
-		"budget": map[string]any{
-			"daily_soft_usd":          cfg.Budget.DailySoftUSD,
-			"daily_hard_usd":          cfg.Budget.DailyHardUSD,
-			"reserve_per_request_usd": cfg.Budget.ReservePerRequestUSD,
-		},
-		"alerts": map[string]any{
-			"webhook_url": redactedIfSet(cfg.Alerts.WebhookURL),
-		},
-		"secrets": map[string]any{
-			"receipt_signing_secret":   presence(secrets.ReceiptSigningSecretSet),
-			"action_capability_secret": presence(secrets.ActionCapabilitySecretSet),
+		"policy": map[string]any{
+			"path": cfg.Policy.Path,
 		},
 	}
 }

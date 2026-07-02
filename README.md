@@ -90,6 +90,10 @@ go run ./cmd/gate \
   -receipt-key-id "$HUBBLEOPS_RECEIPT_KEY_ID"
 ```
 
+Supported receipt signers are `none`, `local` (dev only), and `aws-kms`;
+`gcp-kms` and `vault-transit` are planned but not yet implemented and are
+rejected at startup (see docs/ROADMAP-SIGNERS.md).
+
 `POST /v1/preflight` accepts the same action request shape as the CLI and writes
 the same signed receipt. `require_approval` decisions create an approval request
 in `data/approvals.json` by default. Review it with

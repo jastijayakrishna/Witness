@@ -82,7 +82,7 @@ func newGateRuntime(args []string) (gateRuntime, error) {
 	walSyncMode := fs.String("wal-sync-mode", cfg.WAL.SyncMode, "WAL fsync mode: batch or sync")
 	receiptSecret := fs.String("receipt-secret", os.Getenv("HUBBLEOPS_RECEIPT_SIGNING_SECRET"), "receipt signing secret")
 	receiptKeyID := fs.String("receipt-key-id", envOrDefault("HUBBLEOPS_RECEIPT_KEY_ID", "local"), "receipt key id")
-	receiptSignerMode := fs.String("receipt-signer", cfg.Receipts.Signer, "receipt signer: none, local, aws-kms, gcp-kms, vault-transit")
+	receiptSignerMode := fs.String("receipt-signer", cfg.Receipts.Signer, "receipt signer: none, local, aws-kms (gcp-kms and vault-transit are planned, not yet implemented)")
 	receiptKMSKeyID := fs.String("receipt-kms-key-id", cfg.Receipts.KMSKeyID, "AWS KMS asymmetric key id/arn for receipt signing")
 	receiptKMSRegion := fs.String("receipt-kms-region", cfg.Receipts.KMSRegion, "AWS KMS region for receipt signing")
 	receiptKMSEndpoint := fs.String("receipt-kms-endpoint", cfg.Receipts.KMSEndpoint, "optional AWS KMS endpoint override")
@@ -190,6 +190,11 @@ func newGateRuntime(args []string) (gateRuntime, error) {
 }
 
 func configureReceiptSigner(cfg *config.Config, receiptKeyID, receiptSecret string) (receipts.ReceiptSigner, string, error) {
+	// Reserved-but-stubbed signers (gcp-kms, vault-transit) fail every receipt
+	// write at runtime; refuse them here so the gate never starts with one.
+	if err := config.CheckReceiptSignerImplemented(cfg.Receipts.Signer); err != nil {
+		return nil, "", err
+	}
 	mode := strings.ToLower(strings.TrimSpace(strings.ReplaceAll(cfg.Receipts.Signer, "_", "-")))
 	if mode == "" {
 		if strings.TrimSpace(receiptSecret) != "" {
@@ -217,10 +222,6 @@ func configureReceiptSigner(cfg *config.Config, receiptKeyID, receiptSecret stri
 			Now:             time.Now,
 		}
 		return receipts.NewLazyAwsKmsSigner(receiptKeyID, cfg.Receipts.KMSKeyID, client), "", nil
-	case config.ReceiptSignerGCPKMS:
-		return receipts.NewGCPKMSSigner(receiptKeyID, cfg.Receipts.KMSKeyID), "", nil
-	case config.ReceiptSignerVaultTransit:
-		return receipts.NewVaultTransitSigner(receiptKeyID, cfg.Receipts.KMSKeyID), "", nil
 	default:
 		return nil, "", fmt.Errorf("unsupported receipt signer %q", cfg.Receipts.Signer)
 	}

@@ -297,6 +297,34 @@ func TestFlagsFirstDerivesBoolFlagsFromFlagSet(t *testing.T) {
 	}
 }
 
+// TestRunPreflightUnimplementedSignerExitsUsageBeforeWork: gcp-kms and
+// vault-transit signers are stubs; configuring one must be rejected as a
+// usage error BEFORE any scan or receipt work happens, not fail at receipt
+// write time on every run.
+func TestRunPreflightUnimplementedSignerExitsUsageBeforeWork(t *testing.T) {
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "wal")
+	var code int
+	stderr := captureStderr(t, func() {
+		code = runPreflightTerraform([]string{
+			"-wal-dir", walDir,
+			"-project", "p", "-session", "s1", "-actor", "agent:x",
+			"-env", "production",
+			"-receipt-signer", "vault-transit",
+			filepath.Join("..", "..", "internal", "preflight", "terraform", "testdata", "datatalks_destroy_plan.json"),
+		})
+	})
+	if code != 2 {
+		t.Fatalf("exit=%d want 2 (usage error before any work); stderr=%s", code, stderr)
+	}
+	if !strings.Contains(stderr, "vault-transit") || !strings.Contains(stderr, "not yet implemented") {
+		t.Fatalf("stderr %q must name the stub signer and say it is not yet implemented", stderr)
+	}
+	if files, _ := filepath.Glob(filepath.Join(walDir, "wal-*.jsonl")); len(files) != 0 {
+		t.Fatalf("preflight wrote receipts despite unimplemented signer: %v", files)
+	}
+}
+
 // TestRunPreflightTerraformReceiptWriteFailureExitsInternalError: CI must be
 // able to tell "HubbleOps blocked this" (exit 1) from "HubbleOps itself failed"
 // (exit 4). A receipt write failure is an internal error, not a block.
