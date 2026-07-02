@@ -1,111 +1,74 @@
 # Troubleshooting
 
-## Docker Is Not Running
+## Terraform Plan Does Not Parse
 
-Symptom:
-
-```text
-[fail] Docker is installed but the daemon is not reachable.
-```
-
-Fix: start Docker Desktop, then rerun `make quickstart`.
-
-## Proxy Is Not Ready Yet
-
-Symptom:
-
-```text
-connect: connection refused; is HubbleOps running?
-```
-
-Fix:
+Use Terraform JSON output, not the human plan text:
 
 ```bash
-docker compose -f deploy/docker-compose.yml logs proxy
-docker compose -f deploy/docker-compose.yml up --build -d
-make doctor
+terraform plan -out=tfplan
+terraform show -json tfplan > plan.json
 ```
 
-## Postgres Or Redis Is Unhealthy
+## Policy Does Not Match
 
-Symptom:
+Run with `-json` and inspect `findings[].action`, `findings[].target`, and
+`findings[].change_tags`. Policy rules match those normalized values.
+Finding targets and file paths are fingerprinted in JSON output, so use
+`findings[].action`, `findings[].kind`, `findings[].change_tags`, and readable
+HubbleOps evidence labels to debug matching without exposing raw files or PII.
 
-```text
-[fail] postgres_reachable: status=error
-[fail] redis_reachable: status=error
-```
+## Receipt Is Unsigned
 
-Fix:
-
-```bash
-docker compose -f deploy/docker-compose.yml ps
-docker compose -f deploy/docker-compose.yml logs postgres redis
-```
-
-If ports are already used locally, stop the conflicting services or edit the
-host ports in `deploy/docker-compose.yml`.
-
-## WAL Is Not Writable
-
-Symptom:
-
-```text
-[fail] wal_writable: status=error
-```
-
-Fix: check the proxy logs and Docker volume permissions:
-
-```bash
-docker compose -f deploy/docker-compose.yml logs proxy
-docker compose -f deploy/docker-compose.yml down
-docker compose -f deploy/docker-compose.yml up --build -d
-```
-
-## Auth Failure
-
-Symptom:
-
-```text
-status 401 ... provide -api-key or set HUBBLEOPS_API_KEY
-```
-
-Fix for the local stack: make sure the proxy container is running with
-`HUBBLEOPS_ENV=dev` and `HUBBLEOPS_DEV_AUTH_BYPASS=true`, then rerun `make doctor`.
-
-Fix for production-like runs: create an API key, set `HUBBLEOPS_API_KEY`, and pass
-the matching `X-Project`. See [AUTH.md](AUTH.md).
-
-## Receipt Signing Failure
-
-Symptom:
-
-```text
-[fail] receipt_signing_config: receipt missing signature
-```
-
-Fix for production:
+For local development, set a dev-only signing secret:
 
 ```bash
 export HUBBLEOPS_RECEIPT_SIGNING_SECRET=replace-with-random-secret
-export HUBBLEOPS_RECEIPT_KEY_ID=prod-2026-06
 ```
 
-Unsigned receipts are allowed only for local/dev startup.
-
-## Duplicate Demo Does Not Shadow Or Block
-
-Symptom:
-
-```text
-outcome: duplicate refund was not blocked or shadowed
-```
-
-Fix: run `make doctor` first. If doctor passes, inspect proxy logs and confirm
-the action firewall is connected to Postgres:
+For production gate deployments, configure KMS instead:
 
 ```bash
-docker compose -f deploy/docker-compose.yml logs proxy
+export HUBBLEOPS_RECEIPT_SIGNER=aws-kms
+export HUBBLEOPS_RECEIPT_KMS_KEY_ID=arn:aws:kms:us-east-1:123456789012:key/...
+export HUBBLEOPS_RECEIPT_KMS_REGION=us-east-1
+export HUBBLEOPS_RECEIPT_KEY_ID=prod-2026-07
 ```
 
-The local stack and `make doctor` do not need OpenAI, Anthropic, Gemini, or any
-paid provider key.
+Then pass `-require-signatures` when verifying:
+
+```bash
+go run ./cmd/hubbleops verify-receipts \
+  -receipt-public-keys "$HUBBLEOPS_RECEIPT_PUBLIC_KEYS" \
+  -require-signatures \
+  data/wal/*.jsonl
+```
+
+## WAL Is Not Writable
+
+Pass a writable directory:
+
+```bash
+go run ./cmd/hubbleops preflight terraform plan.json -wal-dir ./data/wal
+```
+
+## Blocked Command Exits Nonzero
+
+That is intentional. A `block` decision exits `1` after the receipt is written.
+A `require_approval` decision exits `3`.
+
+## Approval Was Granted But Preflight Still Requires Review
+
+Rerun the same action request identifiers: `project`, `session_id`, `actor`,
+`action`, `target`, environment, idempotency key, and findings must produce the
+same decision id. Fetch the latest receipt metadata with:
+
+```bash
+curl -s http://localhost:8080/v1/receipts/DECISION_ID
+```
+
+## Go Build Prints Stat Cache Access Denied
+
+In a restricted workspace, `go build` may succeed while printing a non-fatal
+warning about writing the Go module stat cache. Use the process exit code and the
+presence of the requested binary as the build result; the warning does not affect
+HubbleOps receipts or WAL verification.

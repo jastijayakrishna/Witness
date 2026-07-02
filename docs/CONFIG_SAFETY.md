@@ -1,120 +1,87 @@
 # Configuration Safety
 
-HubbleOps validates startup configuration before it opens storage connections or
-serves traffic. Production must be secure by default. Development can stay
-convenient, but unsafe settings produce loud startup warnings.
+The local preflight surface has a small configuration set:
 
-## Environment
+- policy YAML
+- WAL directory
+- receipt signer configuration
+- capture mode
+- approval store path
+- GitHub webhook secret and App private key, when running `cmd/gate`
 
-Set `HUBBLEOPS_ENV` to one of:
+## Safe Defaults
 
-- `dev`: local development and the Docker stack.
-- `test`: automated tests and temporary CI environments.
-- `prod`: customer, investor, or hosted production deployments.
+The CLI defaults to fingerprint capture and writes receipts to `data/wal`.
+Local development can sign receipts with `-receipt-secret` or
+`HUBBLEOPS_RECEIPT_SIGNING_SECRET`, which derives a deterministic Ed25519 key
+on the host. Production forbids that `LocalSecretSigner`; use an external signer
+so the private key cannot be extracted from the gated host.
+Deploy idempotency uses the local ActionStore ledger at `data/action-ledger.json`
+by default; set `HUBBLEOPS_ACTION_LEDGER` in CI if each workspace needs its own
+ledger path.
+GitHub webhook verification is enabled whenever `GITHUB_WEBHOOK_SECRET` is set.
+Store the GitHub App private key in a secret file and pass
+`GITHUB_APP_PRIVATE_KEY_FILE`.
+Approval requests are stored in `data/approvals.json` by default. Review records
+must include reviewer, time, and source; review comments are stored as hashes.
 
-The default is `prod`, so an unset environment cannot accidentally disable
-security controls.
-
-## Production Requirements
-
-In `prod`, HubbleOps refuses to start unless:
-
-- `HUBBLEOPS_AUTH_ENABLED=true`
-- `HUBBLEOPS_DEV_AUTH_BYPASS=false`
-- `HUBBLEOPS_METRICS_PUBLIC=false`
-- `HUBBLEOPS_WAL_DIR` is set
-- `HUBBLEOPS_RECEIPT_SIGNING_SECRET` is set
-- `HUBBLEOPS_REQUIRE_RECEIPT_FOR_BLOCK=true`
-- `HUBBLEOPS_CAPTURE_MODE` is `fingerprint`
-- block mode keeps `HUBBLEOPS_LOOP_REQUIRE_SESSION_FOR_BLOCK=true`
-
-The emergency setting `HUBBLEOPS_ENFORCE_WITHOUT_RECEIPT=true` remains available,
-but startup logs a critical warning because it can enforce unaudited blocks.
-
-## Development Behavior
-
-In `dev` and `test`, HubbleOps does not fail startup for local conveniences such
-as public metrics, disabled auth, dev auth bypass, unsigned receipts, or raw
-capture. Each unsafe setting is logged as a warning.
-
-The local Docker stack sets:
+Production receipt signing uses AWS KMS today:
 
 ```bash
-HUBBLEOPS_ENV=dev
-HUBBLEOPS_DEV_AUTH_BYPASS=true
-HUBBLEOPS_METRICS_PUBLIC=true
+export HUBBLEOPS_RECEIPT_SIGNER=aws-kms
+export HUBBLEOPS_RECEIPT_KMS_KEY_ID=arn:aws:kms:us-east-1:123456789012:key/...
+export HUBBLEOPS_RECEIPT_KMS_REGION=us-east-1
+export HUBBLEOPS_RECEIPT_KEY_ID=prod-2026-07
 ```
 
-Do not use those settings for production.
+Publish the matching Ed25519 public key and `key_id` to auditors. Verification
+remains public-key-only, including rotated keysets passed to
+`verify-receipts -receipt-public-keys`.
 
-## Capture Mode
+The signer role should have only:
 
-Use:
+- `kms:Sign`
+- `kms:GetPublicKey`
 
-```bash
-HUBBLEOPS_CAPTURE_MODE=fingerprint
-```
+It must not have key administration or deletion powers such as
+`kms:ScheduleKeyDeletion`, `kms:DisableKey`, or broad `kms:*`. The gate signs
+with AWS Signature Version 4 using AWS credentials supplied to the process and
+never receives the KMS private key.
 
-This is the production default. Raw capture is for local debugging only. If raw
-capture is explicitly enabled in production with
-`HUBBLEOPS_ALLOW_RAW_CAPTURE_IN_PROD=true`, startup logs a critical warning and
-operators should include `HUBBLEOPS_ALLOW_RAW_CAPTURE_IN_PROD_NOTE`.
+Use `configs/policy.yaml.example` as the starting policy. Copy it to
+`configs/policy.yaml` for customer-specific protected resources.
 
-## Receipt Signing
+## Raw Capture
 
-Production receipts must be signed:
+Do not put raw prompts, raw tool args, raw SQL contents, raw plan contents, raw
+emails, raw CRM rows, raw payment data, raw files, or raw PII into preflight
+flags. The CLI fingerprints intent, target, evidence, and idempotency values
+before writing receipts.
 
-```bash
-HUBBLEOPS_RECEIPT_SIGNING_SECRET=replace-with-random-secret
-HUBBLEOPS_RECEIPT_KEY_ID=prod-2026-06
-```
+The receipt writer also applies a final privacy guard before WAL persistence:
+known safe evidence labels remain readable, while unknown evidence values and
+sensitive-looking identifiers are stored as stable fingerprints. Caller-supplied
+receipt identifiers such as project, session, actor, human delegator, and target
+are fingerprinted by default.
 
-The secret is never printed in the startup config summary.
+CLI and API JSON responses use the same privacy posture. Finding targets and file
+paths are returned as fingerprints, and evidence is readable only for the narrow
+allowlist of HubbleOps-generated labels such as `migration_contains`,
+`terraform_action`, `public_ingress`, `iam_wildcard_policy`,
+`s3_public_access`, `github_linked_ticket`, and `approval_status`.
 
-## Redacted Startup Summary
+## Production Checklist
 
-On startup, the proxy logs a redacted config summary. Secret values are reported
-only as `set`, `unset`, or `<redacted>`.
-
-Redacted fields include:
-
-- Postgres password
-- Redis password
-- alert webhook URL
-- receipt signing secret
-- action capability secret
-- provider target URL credentials or secret query parameters
-
-Provider API keys are request headers and are never included in startup logs.
-
-## Resource Limits (cross-action protections)
-
-The `limits:` section in proxy.yaml declares protections that apply ACROSS
-actions, where the action firewall judges each call in isolation:
-
-- **Cumulative caps** — windowed `amount_cents` totals per agent / session /
-  resource / recipient. Stops "many small refunds, each under the per-action
-  cap" drains.
-- **Velocity limits** — windowed counts of side-effecting actions. Stops retry
-  storms and sprays even when the agent rotates session ids, because buckets
-  are scoped to the authenticated API-key identity, which a client cannot
-  rotate away.
-- **Circuit breaker** — repeated enforced blocks quarantine an agent's
-  fail-closed-risk (money movement / dangerous) actions for a cooldown,
-  without affecting other agents.
-
-Safety properties, validated at startup (a half-declared rule fails startup in
-every environment):
-
-- All rules are operator-declared. Nothing about a limit is client-tunable.
-- Limits run before the idempotency claim, so a rejected action never holds a
-  pending lease.
-- Counters track ATTEMPTS at decide time and are never refunded on failure —
-  conservative in the safe direction. Duplicate replays also count toward
-  caps.
-- Windows are fixed buckets: a burst straddling a boundary can briefly reach
-  ~2x a cap.
-- Shadow mode records what limits would do without enforcing, and shadow
-  decisions never count as breaker trips.
-- If limit state is unreachable, write-tier actions fail open; fail-closed
-  risks (money movement / dangerous) fail closed.
+1. Configure an external receipt signer; production refuses `LocalSecretSigner`
+   and `HUBBLEOPS_RECEIPT_SIGNING_SECRET`.
+2. Use stable `project`, `session`, and `actor` identifiers.
+3. Keep the policy file reviewed in source control.
+4. Publish receipt public keys by `key_id` and verify receipts with
+   `-require-signatures`.
+5. Use stable deploy idempotency keys so repeated release attempts replay or block.
+6. Export reviewed labels anonymized by default.
+7. For GitHub App mode, grant Actions read and upload PR Terraform plan artifacts.
+   A Terraform-touched PR without a matching plan artifact is intentionally
+   `require_approval` / `action_required`.
+8. Require the GitHub check in branch protection only after shadowing real PRs.
+9. Back up the approval store with the WAL when using file-backed approvals.

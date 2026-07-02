@@ -1,36 +1,63 @@
 SHELL := bash
 .SHELLFLAGS := -euo pipefail -c
 
-COMPOSE ?= docker compose -f deploy/docker-compose.yml
 HUBBLEOPS ?= go run ./cmd/hubbleops
-BASE_URL ?= http://localhost:8080
+GATE ?= go run ./cmd/gate
+PLAN ?= internal/preflight/terraform/testdata/datatalks_destroy_plan.json
+POLICY ?= configs/policy.yaml.example
+WAL_DIR ?= data/wal
+ACTION_LEDGER ?= data/action-ledger.json
+APPROVAL_STORE ?= data/approvals.json
 
-.PHONY: check-prereqs up quickstart doctor test
+.PHONY: preflight-terraform preflight-deploy phase4-demo gate verify-receipts evidence-pack test sqlparse-build
 
-check-prereqs:
-	bash scripts/check-prereqs.sh
+# Build the optional SQL parse-validity oracle (separate module; Linux + cgo, Go >= 1.26.4).
+# Its heavy parser deps live in internal/sqlparse and never touch the root module graph.
+sqlparse-build:
+	cd internal/sqlparse && go mod tidy && CGO_ENABLED=1 go build -o hubbleops-sqlparse .
+	@echo "built internal/sqlparse/hubbleops-sqlparse; wire it via HUBBLEOPS_SQLPARSE_BIN"
 
-up:
-	$(COMPOSE) up --build -d
+preflight-terraform:
+	$(HUBBLEOPS) preflight terraform $(PLAN) \
+		-policy $(POLICY) \
+		-wal-dir $(WAL_DIR) \
+		-project demo \
+		-session demo-preflight \
+		-actor agent:local-cli \
+		-human-delegator local \
+		-env production \
+		-intent "demo protected destroy"
 
-doctor:
-	$(HUBBLEOPS) doctor -base-url $(BASE_URL)
+preflight-deploy:
+	$(HUBBLEOPS) preflight deploy \
+		-service billing-api \
+		-artifact demo-sha \
+		-idempotency-key deploy:demo-sha \
+		-policy $(POLICY) \
+		-wal-dir $(WAL_DIR) \
+		-action-ledger $(ACTION_LEDGER) \
+		-project demo \
+		-session demo-deploy \
+		-actor agent:local-cli \
+		-human-delegator local \
+		-env production
 
-quickstart: check-prereqs up
-	@echo "Waiting for HubbleOps to become ready..."
-	@tmp="$${TMPDIR:-/tmp}/hubbleops-doctor.log"; \
-	for i in $$(seq 1 60); do \
-		if $(HUBBLEOPS) doctor -base-url $(BASE_URL) > "$$tmp" 2>&1; then \
-			cat "$$tmp"; \
-			break; \
-		fi; \
-		if [ "$$i" -eq 60 ]; then \
-			cat "$$tmp"; \
-			echo "HubbleOps did not become ready. Run: docker compose -f deploy/docker-compose.yml logs proxy" >&2; \
-			exit 1; \
-		fi; \
-		sleep 2; \
-	done
+phase4-demo:
+	$(HUBBLEOPS) demo phase4 \
+		-wal-dir data/phase4-demo/wal \
+		-approval-store data/phase4-demo/approvals.json
+
+gate:
+	$(GATE) \
+		-policy $(POLICY) \
+		-wal-dir $(WAL_DIR) \
+		-approval-store $(APPROVAL_STORE)
+
+verify-receipts:
+	$(HUBBLEOPS) verify-receipts data/wal/*.jsonl
+
+evidence-pack:
+	$(HUBBLEOPS) evidence-pack data/wal/*.jsonl
 
 test:
 	go test ./...

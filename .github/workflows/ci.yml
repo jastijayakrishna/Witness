@@ -4,10 +4,15 @@ on:
   push:
     branches: ["main"]
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
 
 jobs:
-  test:
+  verify:
     runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -15,6 +20,44 @@ jobs:
         with:
           go-version: "1.25.x"
           cache: true
+
+      - name: Go race tests
+        run: go test ./... -race -count=1 -shuffle=on
+
+  integration:
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "1"
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+      HUBBLEOPS_INTEGRATION_S3_ENDPOINT: http://127.0.0.1:9000
+      HUBBLEOPS_INTEGRATION_S3_BUCKET: hubbleops-audit
+      HUBBLEOPS_INTEGRATION_S3_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache: true
+
+      - name: Start MinIO Object Lock bucket
+        run: |
+          docker compose -f deploy/minio-objectlock-compose.yml up -d minio
+          docker compose -f deploy/minio-objectlock-compose.yml run --rm minio-init
+
+      - name: Go integration tests
+        run: go test -tags "integration docker" ./...
+
+      - name: Stop MinIO
+        if: always()
+        run: docker compose -f deploy/minio-objectlock-compose.yml down -v
+
+  sdk-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
@@ -24,11 +67,30 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Go tests
-        run: go test ./...
-
       - name: JavaScript SDK syntax
-        run: node --check sdk/javascript/hubbleops-agent/index.js
+        run: |
+          if [ -f sdk/javascript/hubbleops-agent/index.js ]; then
+            node --check sdk/javascript/hubbleops-agent/index.js
+          fi
 
       - name: Python SDK syntax
-        run: python -m py_compile sdk/python/hubbleops_agent/langchain.py sdk/python/hubbleops_agent/__init__.py
+        run: |
+          if [ -d sdk/python ]; then
+            python -m py_compile $(find sdk/python -name '*.py')
+          fi
+
+  nightly-race-stress:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache: true
+
+      - name: Hot concurrency stress tests
+        run: go test ./internal/wal ./internal/loop -race -count=100 -shuffle=on -run 'TestWriter_ConcurrentWriteSigned|TestAnchorPublish_ConcurrentWithWrites|TestFileLedger_ConcurrentProcesses'

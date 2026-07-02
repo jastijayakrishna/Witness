@@ -109,6 +109,11 @@ v1 derivation intentionally changes IDs, so pre-existing pending approvals keyed
 to v1 decision IDs will not match v2 preflight decisions and must be requested
 again.
 
+Long-lived gate processes sweep expired ActionStore ledger rows every 10 minutes
+so Postgres and file-backed ledgers do not grow forever. Set
+`HUBBLEOPS_LEDGER_SWEEP_INTERVAL` to a Go duration such as `5m` to tune it, or
+`0` to disable it.
+
 `POST /github/webhook` handles GitHub `pull_request` events, verifies
 `X-Hub-Signature-256` when `GITHUB_WEBHOOK_SECRET` is set, loads changed files and
 CODEOWNERS through GitHub App installation auth, then creates a check run named

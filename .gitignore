@@ -23,12 +23,16 @@ test-report.txt
 test-results.csv
 test-summary.txt
 .gocache/
+.gocache-test/
 __pycache__/
 *.py[cod]
 .pytest_cache/
 
 # Vendor (use go mod)
 /vendor/
+
+# Stray Go module cache from a local GOMODCACHE override (never commit)
+/.gomodcache/
 
 # IDE
 .idea/
