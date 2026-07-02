@@ -9,7 +9,7 @@ func TestProdMissingAuthConfigFails(t *testing.T) {
 	cfg := productionSafeTestConfig()
 	cfg.Auth.Enabled = false
 
-	_, err := cfg.Validate(RuntimeSecrets{ReceiptSigningSecretSet: true})
+	_, err := cfg.Validate(RuntimeSecrets{})
 	if err == nil {
 		t.Fatalf("Validate succeeded, want auth failure")
 	}
@@ -18,15 +18,31 @@ func TestProdMissingAuthConfigFails(t *testing.T) {
 	}
 }
 
-func TestProdMissingReceiptSigningSecretFails(t *testing.T) {
+func TestProdMissingExternalReceiptSignerFails(t *testing.T) {
 	cfg := productionSafeTestConfig()
+	cfg.Receipts.Signer = ""
+	cfg.Receipts.KMSKeyID = ""
+	cfg.Receipts.KMSRegion = ""
 
 	_, err := cfg.Validate(RuntimeSecrets{})
 	if err == nil {
 		t.Fatalf("Validate succeeded, want receipt signing failure")
 	}
-	if !strings.Contains(err.Error(), "HUBBLEOPS_RECEIPT_SIGNING_SECRET") {
-		t.Fatalf("error %q does not mention receipt signing", err.Error())
+	if !strings.Contains(err.Error(), "external receipt signer") {
+		t.Fatalf("error %q does not mention external receipt signer", err.Error())
+	}
+}
+
+func TestProdLocalSecretSignerFails(t *testing.T) {
+	cfg := productionSafeTestConfig()
+	cfg.Receipts.Signer = "local"
+
+	_, err := cfg.Validate(RuntimeSecrets{ReceiptSigningSecretSet: true})
+	if err == nil {
+		t.Fatalf("Validate succeeded, want local signer failure")
+	}
+	if !strings.Contains(err.Error(), "forbids LocalSecretSigner") {
+		t.Fatalf("error %q does not mention local signer", err.Error())
 	}
 }
 
@@ -34,7 +50,7 @@ func TestProdRawCaptureFailsUnlessExplicit(t *testing.T) {
 	cfg := productionSafeTestConfig()
 	cfg.Capture.Mode = "raw"
 
-	_, err := cfg.Validate(RuntimeSecrets{ReceiptSigningSecretSet: true})
+	_, err := cfg.Validate(RuntimeSecrets{})
 	if err == nil {
 		t.Fatalf("Validate succeeded, want raw capture failure")
 	}
@@ -43,7 +59,7 @@ func TestProdRawCaptureFailsUnlessExplicit(t *testing.T) {
 	}
 
 	cfg.Capture.AllowRawInProd = true
-	result, err := cfg.Validate(RuntimeSecrets{ReceiptSigningSecretSet: true})
+	result, err := cfg.Validate(RuntimeSecrets{})
 	if err != nil {
 		t.Fatalf("Validate explicit raw capture: %v", err)
 	}
@@ -52,25 +68,11 @@ func TestProdRawCaptureFailsUnlessExplicit(t *testing.T) {
 	}
 }
 
-func TestProdBlockModeRequiresSessionSafetyFloor(t *testing.T) {
-	cfg := productionSafeTestConfig()
-	cfg.LoopDetection.Action = "block"
-	cfg.LoopDetection.RequireSessionForBlock = false
-
-	_, err := cfg.Validate(RuntimeSecrets{ReceiptSigningSecretSet: true})
-	if err == nil {
-		t.Fatalf("Validate succeeded, want block session failure")
-	}
-	if !strings.Contains(err.Error(), "HUBBLEOPS_LOOP_REQUIRE_SESSION_FOR_BLOCK=true") {
-		t.Fatalf("error %q does not mention session safety floor", err.Error())
-	}
-}
-
 func TestProdOutcomeCaptureStaysFingerprintOnly(t *testing.T) {
 	cfg := productionSafeTestConfig()
 	cfg.OutcomeCapture.Mode = "raw"
 
-	_, err := cfg.Validate(RuntimeSecrets{ReceiptSigningSecretSet: true})
+	_, err := cfg.Validate(RuntimeSecrets{})
 	if err == nil {
 		t.Fatalf("Validate succeeded, want outcome capture mode failure")
 	}
@@ -80,7 +82,7 @@ func TestProdOutcomeCaptureStaysFingerprintOnly(t *testing.T) {
 
 	cfg = productionSafeTestConfig()
 	cfg.OutcomeCapture.Raw = true
-	_, err = cfg.Validate(RuntimeSecrets{ReceiptSigningSecretSet: true})
+	_, err = cfg.Validate(RuntimeSecrets{})
 	if err == nil {
 		t.Fatalf("Validate succeeded, want raw outcome capture failure")
 	}
@@ -93,7 +95,7 @@ func TestProdRawReviewNotesRequireRawCaptureOverride(t *testing.T) {
 	cfg := productionSafeTestConfig()
 	cfg.Reviews.RawNotes = true
 
-	_, err := cfg.Validate(RuntimeSecrets{ReceiptSigningSecretSet: true})
+	_, err := cfg.Validate(RuntimeSecrets{})
 	if err == nil {
 		t.Fatalf("Validate succeeded, want raw review notes failure")
 	}
@@ -103,7 +105,7 @@ func TestProdRawReviewNotesRequireRawCaptureOverride(t *testing.T) {
 
 	cfg.Capture.Mode = "raw"
 	cfg.Capture.AllowRawInProd = true
-	result, err := cfg.Validate(RuntimeSecrets{ReceiptSigningSecretSet: true})
+	result, err := cfg.Validate(RuntimeSecrets{})
 	if err != nil {
 		t.Fatalf("Validate raw review notes with explicit override: %v", err)
 	}
@@ -122,6 +124,9 @@ func TestDevStartsWithWarnings(t *testing.T) {
 	cfg.OutcomeCapture.Mode = "raw"
 	cfg.OutcomeCapture.Raw = true
 	cfg.Reviews.RawNotes = true
+	cfg.Receipts.Signer = ""
+	cfg.Receipts.KMSKeyID = ""
+	cfg.Receipts.KMSRegion = ""
 
 	result, err := cfg.Validate(RuntimeSecrets{})
 	if err != nil {
@@ -131,7 +136,7 @@ func TestDevStartsWithWarnings(t *testing.T) {
 		"auth disabled",
 		"dev auth bypass",
 		"metrics endpoint is public",
-		"receipt signing secret unset",
+		"receipt signer unset",
 		"raw capture enabled",
 		"raw outcome capture requested",
 		"raw review notes enabled",
@@ -145,17 +150,10 @@ func TestDevStartsWithWarnings(t *testing.T) {
 func TestSecretsRedactedInConfigOutput(t *testing.T) {
 	cfg := productionSafeTestConfig()
 	cfg.Postgres.Password = "postgres-super-secret"
-	cfg.Redis.Password = "redis-super-secret"
-	cfg.Alerts.WebhookURL = "https://hooks.example.test/services/token-secret"
 
-	out := cfg.RedactedSummaryJSON(RuntimeSecrets{
-		ReceiptSigningSecretSet:   true,
-		ActionCapabilitySecretSet: true,
-	})
+	out := cfg.RedactedSummaryJSON(RuntimeSecrets{})
 	for _, leaked := range []string{
 		"postgres-super-secret",
-		"redis-super-secret",
-		"token-secret",
 	} {
 		if strings.Contains(out, leaked) {
 			t.Fatalf("redacted summary leaked %q: %s", leaked, out)
@@ -164,7 +162,10 @@ func TestSecretsRedactedInConfigOutput(t *testing.T) {
 	if !strings.Contains(out, redacted) {
 		t.Fatalf("redacted summary missing redaction marker: %s", out)
 	}
-	if !strings.Contains(out, `"receipt_signing_secret":"set"`) {
+	if !strings.Contains(out, `"signer":"aws-kms"`) {
+		t.Fatalf("redacted summary missing signer: %s", out)
+	}
+	if !strings.Contains(out, `"signing_secret":"unset"`) {
 		t.Fatalf("redacted summary missing secret presence: %s", out)
 	}
 }
@@ -198,9 +199,9 @@ func productionSafeTestConfig() *Config {
 	cfg.WAL.SyncMode = "batch"
 	cfg.Receipts.RequireForBlock = true
 	cfg.Receipts.EnforceWithoutReceipt = false
-	cfg.LoopDetection.Enabled = true
-	cfg.LoopDetection.Action = "shadow"
-	cfg.LoopDetection.RequireSessionForBlock = true
+	cfg.Receipts.Signer = ReceiptSignerAWSKMS
+	cfg.Receipts.KMSKeyID = "arn:aws:kms:us-east-1:123456789012:key/prod"
+	cfg.Receipts.KMSRegion = "us-east-1"
 	return cfg
 }
 

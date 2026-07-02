@@ -157,6 +157,7 @@ func runPreflightDeployResult(args []string) int {
 	service := fs.String("service", "", "service that was deployed")
 	artifact := fs.String("artifact", envOrDefault([]string{"HUBBLEOPS_DEPLOY_ARTIFACT", "GITHUB_SHA"}, ""), "deploy artifact, version, or commit")
 	status := fs.String("status", "", "deploy result: success or failed")
+	decisionID := fs.String("decision-id", "", "decision id from the deploy preflight receipt; required for owned idempotency invalidation")
 	if code, ok := parsePreflightFlags(fs, args); !ok {
 		return code
 	}
@@ -204,11 +205,18 @@ func runPreflightDeployResult(args []string) int {
 	decision := gate.Decide(req, findings, pol)
 	if st == "failed" {
 		store := loop.NewFileActionStore(cfg.ActionLedgerPath)
-		if err := store.Invalidate(context.Background(), req.Project, cfg.IdempotencyKey); err != nil {
+		var err error
+		if owner := strings.TrimSpace(*decisionID); owner != "" {
+			err = store.InvalidateOwned(context.Background(), req.Project, cfg.IdempotencyKey, owner)
+		} else {
+			fmt.Fprintln(os.Stderr, "warning: unowned deploy idempotency invalidation is deprecated; pass -decision-id from the deploy preflight receipt")
+			err = store.Invalidate(context.Background(), req.Project, cfg.IdempotencyKey)
+		}
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "release deploy idempotency: %v\n", err)
 			return exitInternalError
 		}
-		decision = withDecisionEvidence(decision, []string{"deploy_idempotency=released"})
+		decision = withDecisionEvidence(decision, []string{"deploy_idempotency=release_requested"})
 	} else {
 		decision = withDecisionEvidence(decision, []string{"deploy_idempotency=retained"})
 	}

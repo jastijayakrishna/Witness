@@ -9,8 +9,6 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-
-	"github.com/hubbleops/hubbleops/internal/moatmetrics"
 )
 
 const (
@@ -113,7 +111,6 @@ func RejectRawCaptureIfDisabled(captureMode string, rawEnabled bool) error {
 		captureMode = CaptureModeFingerprint
 	}
 	if captureMode == CaptureModeRaw && !rawEnabled {
-		moatmetrics.RecordRawCaptureRejection()
 		return ErrRawCaptureDisabled
 	}
 	return nil
@@ -144,14 +141,12 @@ func SafeEvidence(signals, evidence []string) []byte {
 			continue
 		}
 		if parsed, ok := parseJSONValue(item); ok {
-			moatmetrics.RecordPrivacyRedaction()
 			items = append(items, map[string]string{
 				"evidence_fingerprint": FingerprintJSON(parsed),
 				"evidence_shape":       shapeName(parsed),
 			})
 			continue
 		}
-		moatmetrics.RecordPrivacyRedaction()
 		items = append(items, map[string]string{"evidence_fingerprint": FingerprintString(item)})
 	}
 	if len(items) == 0 {
@@ -212,7 +207,7 @@ func ContainsSensitiveText(value string) bool {
 		"credit_card", "credit-card", "card_number", "card-number",
 		"address", "raw_args", "raw_body", "raw_output", "prompt",
 		"payment", "crm", "db_row", "private_key", "idempotency_key",
-		"resource_id",
+		"resource_id", "raw_", "raw-",
 	} {
 		if strings.Contains(lower, marker) {
 			return true
@@ -242,9 +237,6 @@ func redactKnownSecrets(value any) any {
 	case string:
 		if ContainsSensitiveText(typed) {
 			redacted := RedactString(typed)
-			if redacted == typed {
-				moatmetrics.RecordPrivacyRedaction()
-			}
 			return redacted
 		}
 		return typed
@@ -258,7 +250,6 @@ func redactKnownSecrets(value any) any {
 		out := make(map[string]any, len(typed))
 		for key, child := range typed {
 			if IsSensitiveKey(key) {
-				moatmetrics.RecordPrivacyRedaction()
 				out[sensitiveFieldKey(key)] = fingerprintedValue(child)
 				continue
 			}
@@ -274,9 +265,9 @@ func fingerprintedValue(value any) map[string]any {
 	parsed := jsonLikeValue(value)
 	return map[string]any{
 		"hubbleops_capture": "fingerprint",
-		"sha256":          strings.TrimPrefix(fingerprintRaw(parsed), "sha256:"),
-		"type":            shapeName(parsed),
-		"shape":           structuralShape(parsed),
+		"sha256":            strings.TrimPrefix(fingerprintRaw(parsed), "sha256:"),
+		"type":              shapeName(parsed),
+		"shape":             structuralShape(parsed),
 	}
 }
 
@@ -414,7 +405,6 @@ func shortHash(value string) string {
 }
 
 func redactionMarker(value string) string {
-	moatmetrics.RecordPrivacyRedaction()
 	return "<redacted:" + FingerprintString(value) + ">"
 }
 

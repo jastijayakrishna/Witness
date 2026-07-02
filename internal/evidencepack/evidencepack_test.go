@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hubbleops/hubbleops/internal/action"
 	"github.com/hubbleops/hubbleops/internal/loop"
 	"github.com/hubbleops/hubbleops/internal/receipts"
 	"github.com/hubbleops/hubbleops/internal/wal"
@@ -12,16 +13,21 @@ import (
 
 func signedChain(t *testing.T, secret string, recs []wal.Record) []wal.Record {
 	t.Helper()
+	signer := receipts.NewSigner("test", []byte(secret))
 	prev := "genesis"
 	for i := range recs {
-		sig, err := receipts.SignRecord([]byte(secret), recs[i])
+		seq := uint64(i + 1)
+		recs[i].ReceiptKeyID = signer.KeyID()
+		if err := wal.Chain(&recs[i], prev, seq); err != nil {
+			t.Fatalf("chain: %v", err)
+		}
+		sig, kid, err := signer.SignRecord(recs[i])
 		if err != nil {
 			t.Fatalf("sign: %v", err)
 		}
-		recs[i].ReceiptSignature = sig
-		recs[i].ReceiptKeyID = "test"
-		if err := wal.Chain(&recs[i], prev); err != nil {
-			t.Fatalf("chain: %v", err)
+		recs[i].ReceiptSignature, recs[i].ReceiptKeyID = sig, kid
+		if err := wal.Chain(&recs[i], prev, seq); err != nil {
+			t.Fatalf("rechain signed: %v", err)
 		}
 		prev = recs[i].RecordHash
 	}
@@ -32,14 +38,20 @@ func baseRecord(decisionID string, when time.Time) wal.Record {
 	return wal.Record{
 		Time:            when,
 		Project:         "acme",
-		Provider:        "_tool",
-		Model:           "pre_tool",
-		DecisionStage:   "pre_tool",
+		Provider:        "_preflight",
+		Model:           "preflight",
+		DecisionStage:   "preflight",
 		DecisionID:      decisionID,
-		ToolSignature:   "refund_customer",
-		ActionRisk:      "write",
-		PolicyVersion:   loop.ActionPolicyVersion,
-		DetectorVersion: loop.DetectorVersion,
+		SessionID:       "session-a",
+		Actor:           "agent:claude-code",
+		Action:          "terraform.destroy",
+		Target:          "aws_s3_bucket.audit_logs_prod",
+		Environment:     "production",
+		Decision:        action.DecisionBlock,
+		RiskScore:       95,
+		ActionRisk:      action.RiskCritical,
+		PolicyVersion:   action.PolicyVersion,
+		DetectorVersion: "preflight",
 		DecisionReason:  "decision",
 	}
 }
@@ -49,14 +61,19 @@ func TestBuildEvidencePackCountsAndControls(t *testing.T) {
 	when := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
 
 	dup := baseRecord("dec_dup", when)
+	dup.Provider = "_tool"
+	dup.Model = "pre_tool"
+	dup.DecisionStage = "pre_tool"
+	dup.ToolSignature = "refund_customer"
+	dup.Decision = ""
 	dup.LoopAction = "shadow_would_block"
 	dup.LoopSignalsFired = loop.SignalDuplicateSideEffect
 	dup.ResultClass = "duplicate"
+	dup.PolicyVersion = loop.ActionPolicyVersion
+	dup.DetectorVersion = loop.DetectorVersion
 
 	policy := baseRecord("dec_policy", when)
-	policy.LoopAction = "block"
 	policy.ImmediateOutcome = "blocked"
-	policy.LoopSignalsFired = loop.SignalPolicyAmountExceeded
 
 	records := signedChain(t, secret, []wal.Record{dup, policy})
 
@@ -85,8 +102,8 @@ func TestBuildEvidencePackCountsAndControls(t *testing.T) {
 	if got["Duplicate side-effect actions prevented"].Count != 1 {
 		t.Fatalf("duplicate count=%d want 1", got["Duplicate side-effect actions prevented"].Count)
 	}
-	if got["Policy violations blocked"].Count != 1 {
-		t.Fatalf("policy count=%d want 1", got["Policy violations blocked"].Count)
+	if got["High-risk engineering changes blocked"].Count != 1 {
+		t.Fatalf("blocked change count=%d want 1", got["High-risk engineering changes blocked"].Count)
 	}
 	if _, ok := got["Tamper-evident decision log"]; !ok {
 		t.Fatalf("missing tamper-evident decision log line item")

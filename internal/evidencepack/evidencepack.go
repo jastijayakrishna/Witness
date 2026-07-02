@@ -1,8 +1,8 @@
 // Package evidencepack turns a HubbleOps WAL export into a compliance-ready evidence
-// pack: a date-ranged summary of what the agent did, what HubbleOps enforced, an
-// integrity proof of the underlying log, and an indicative mapping of each line item to
-// the controls a SOC 2 / ISO 42001 / EU AI Act reviewer cares about. It is a reformat of
-// data HubbleOps already records (shadowreport + receiptverify), not a new system.
+// pack: a date-ranged summary of what engineering actions agents attempted, what
+// HubbleOps enforced, an integrity proof of the underlying log, and an indicative
+// mapping of each line item to change-governance controls. It is a reformat of data
+// HubbleOps already records (WAL + receiptverify), not a new system.
 package evidencepack
 
 import (
@@ -12,9 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hubbleops/hubbleops/internal/loop"
 	"github.com/hubbleops/hubbleops/internal/receiptverify"
-	"github.com/hubbleops/hubbleops/internal/shadowreport"
 	"github.com/hubbleops/hubbleops/internal/wal"
 )
 
@@ -76,6 +74,7 @@ type Pack struct {
 	TotalActionDecisions int        `json:"total_action_decisions"`
 	Blocked              int        `json:"blocked"`
 	WouldBlock           int        `json:"would_block"`
+	ApprovalRequired     int        `json:"approval_required"`
 	Integrity            Integrity  `json:"integrity"`
 	LineItems            []LineItem `json:"line_items"`
 	Notice               string     `json:"notice"`
@@ -102,14 +101,15 @@ func Build(records []wal.Record, opts Options) Pack {
 		ReceiptPublicKey: opts.ReceiptPublicKey,
 		ReceiptSecret:    opts.ReceiptSecret,
 	})
-	summary := shadowreport.Build(filtered)
+	summary := summarize(filtered)
 
 	pack := Pack{
 		GeneratedAt:          time.Now().UTC(),
 		Project:              opts.Project,
 		TotalActionDecisions: summary.TotalActionDecisions,
 		Blocked:              summary.Blocked,
-		WouldBlock:           summary.WouldBlockDecisions,
+		WouldBlock:           summary.WouldBlock,
+		ApprovalRequired:     summary.ApprovalRequired,
 		Integrity: Integrity{
 			RecordsVerified:     verifyReport.ActionReceipts,
 			SignedReceipts:      verifyReport.SignedReceipts,
@@ -131,34 +131,25 @@ func Build(records []wal.Record, opts Options) Pack {
 		pack.Until = &u
 	}
 
-	policyViolations := countPolicyViolations(filtered)
-	overrides := countOverrides(filtered)
-
 	// The decision log itself is the headline record-keeping control, present whenever
 	// there is any recorded activity.
 	if summary.TotalActionDecisions > 0 || len(filtered) > 0 {
 		pack.LineItems = append(pack.LineItems, LineItem{
 			Category:    "Tamper-evident decision log",
 			Count:       verifyReport.ActionReceipts,
-			Description: "Every agent action was recorded to a hash-chained, signed write-ahead log before/after execution.",
+			Description: "Every agent engineering-action decision was recorded to a hash-chained, signed write-ahead log.",
 			Controls:    []Control{socCC7_2, isoLogging, aiActArt12},
 		})
 	}
+	addLineItem(&pack, "High-risk engineering changes blocked", summary.Blocked,
+		"Terraform, migration, deploy, or PR actions that matched a blocking policy were stopped before execution.",
+		[]Control{socCC6_1, socCC8_1, isoOperation, aiActArt9, aiActArt14})
+	addLineItem(&pack, "Engineering changes requiring approval", summary.ApprovalRequired,
+		"Risky changes were paused for customer review before execution.",
+		[]Control{socCC2_2, socCC8_1, isoOversight, aiActArt14})
 	addLineItem(&pack, "Duplicate side-effect actions prevented", summary.DuplicateSideEffectDecisions,
 		"Repeated consequential actions with a stable idempotency key were caught before re-execution.",
 		[]Control{socCC8_1, isoOperation, aiActArt15})
-	addLineItem(&pack, "Policy violations blocked", policyViolations,
-		"Actions exceeding an amount cap, targeting a disallowed recipient, missing a required safety precondition, or carrying an invalid capability were blocked.",
-		[]Control{socCC6_1, isoOversight, aiActArt9, aiActArt14})
-	addLineItem(&pack, "Runaway-loop / no-progress interventions", summary.NoProgressDecisions,
-		"Agents repeating tool calls with no progress were halted.",
-		[]Control{socCC7_2, aiActArt15})
-	addLineItem(&pack, "Budget circuit-breaker events", summary.BudgetDecisions,
-		"Actions that would exceed the configured cost/budget ceiling were stopped.",
-		[]Control{socCC7_2, aiActArt15})
-	addLineItem(&pack, "Human oversight (reviews / overrides)", overrides,
-		"A human reviewed or overrode an enforcement decision, with the action recorded.",
-		[]Control{socCC2_2, isoOversight, aiActArt14})
 
 	return pack
 }
@@ -192,37 +183,6 @@ func filterRecords(records []wal.Record, opts Options) []wal.Record {
 	return out
 }
 
-// countPolicyViolations counts distinct decisions that fired a hard policy-block signal.
-func countPolicyViolations(records []wal.Record) int {
-	signals := []string{
-		loop.SignalPolicyAmountExceeded,
-		loop.SignalRecipientOutOfPolicy,
-		loop.SignalMissingSafetyPrecondition,
-		loop.SignalInvalidCapability,
-		loop.SignalIdempotencyKeyReuseMismatch,
-	}
-	seen := map[string]struct{}{}
-	for _, rec := range records {
-		for _, sig := range signals {
-			if strings.Contains(rec.LoopSignalsFired, sig) {
-				seen[decisionKey(rec)] = struct{}{}
-				break
-			}
-		}
-	}
-	return len(seen)
-}
-
-func countOverrides(records []wal.Record) int {
-	seen := map[string]struct{}{}
-	for _, rec := range records {
-		if rec.LoopAction == "overridden" {
-			seen[decisionKey(rec)] = struct{}{}
-		}
-	}
-	return len(seen)
-}
-
 func decisionKey(rec wal.Record) string {
 	if rec.DecisionID != "" {
 		return rec.DecisionID
@@ -231,6 +191,47 @@ func decisionKey(rec wal.Record) string {
 		return rec.RecordHash
 	}
 	return fmt.Sprintf("%s|%s|%s|%s", rec.Project, rec.SessionID, rec.ToolSignature, rec.DecisionStage)
+}
+
+type summaryStats struct {
+	TotalActionDecisions         int
+	Blocked                      int
+	WouldBlock                   int
+	ApprovalRequired             int
+	DuplicateSideEffectDecisions int
+}
+
+func summarize(records []wal.Record) summaryStats {
+	seenDecisions := map[string]struct{}{}
+	blocked := map[string]struct{}{}
+	wouldBlock := map[string]struct{}{}
+	approval := map[string]struct{}{}
+	duplicates := map[string]struct{}{}
+	for _, rec := range records {
+		if rec.DecisionID == "" {
+			continue
+		}
+		key := decisionKey(rec)
+		seenDecisions[key] = struct{}{}
+		switch strings.ToLower(strings.TrimSpace(firstNonEmpty(rec.Decision, rec.LoopAction))) {
+		case "block":
+			blocked[key] = struct{}{}
+		case "shadow_would_block":
+			wouldBlock[key] = struct{}{}
+		case "require_approval":
+			approval[key] = struct{}{}
+		}
+		if strings.Contains(rec.LoopSignalsFired, "duplicate_side_effect") {
+			duplicates[key] = struct{}{}
+		}
+	}
+	return summaryStats{
+		TotalActionDecisions:         len(seenDecisions),
+		Blocked:                      len(blocked),
+		WouldBlock:                   len(wouldBlock),
+		ApprovalRequired:             len(approval),
+		DuplicateSideEffectDecisions: len(duplicates),
+	}
 }
 
 // RenderJSON returns the machine-readable evidence pack.
@@ -248,7 +249,7 @@ func RenderMarkdown(pack Pack) string {
 	}
 	fmt.Fprintf(&b, "- Period: %s\n", periodString(pack))
 	fmt.Fprintf(&b, "- Agent actions recorded: %d\n", pack.TotalActionDecisions)
-	fmt.Fprintf(&b, "- Actions blocked: %d (enforced) + %d (would-block in shadow mode)\n", pack.Blocked, pack.WouldBlock)
+	fmt.Fprintf(&b, "- Actions blocked: %d; approvals required: %d; would-block in shadow mode: %d\n", pack.Blocked, pack.ApprovalRequired, pack.WouldBlock)
 
 	b.WriteString("\n## Log integrity\n\n")
 	in := pack.Integrity
@@ -306,4 +307,13 @@ func yesNo(v bool) string {
 		return "yes"
 	}
 	return "no"
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }

@@ -575,6 +575,40 @@ func TestRunPreflightDeployResultFailedFreesKey(t *testing.T) {
 	}
 }
 
+func TestRunPreflightDeployResultFailedWithDecisionIDRequiresOwner(t *testing.T) {
+	dir := t.TempDir()
+	if code := runPreflightDeploy(deployArgs(dir, "s1", "deploy:k-owned")); code != 0 {
+		t.Fatalf("first deploy=%d want 0 allow", code)
+	}
+	files, err := filepath.Glob(filepath.Join(dir, "wal", "wal-*.jsonl"))
+	if err != nil || len(files) != 1 {
+		t.Fatalf("wal files=%v err=%v", files, err)
+	}
+	records, err := readWALRecords(files)
+	if err != nil {
+		t.Fatalf("read wal: %v", err)
+	}
+	if len(records) == 0 || records[0].DecisionID == "" {
+		t.Fatalf("first receipt missing decision id: %+v", records)
+	}
+
+	wrongOwner := append(deployArgs(dir, "s2", "deploy:k-owned"), "-status", "failed", "-decision-id", "dec_wrong")
+	if code := runPreflightDeployResult(wrongOwner); code != 0 {
+		t.Fatalf("deploy-result wrong owner=%d want 0", code)
+	}
+	if code := runPreflightDeploy(deployArgs(dir, "s3", "deploy:k-owned")); code != 1 {
+		t.Fatalf("retry after wrong owner=%d want duplicate block", code)
+	}
+
+	correctOwner := append(deployArgs(dir, "s4", "deploy:k-owned"), "-status", "failed", "-decision-id", records[0].DecisionID)
+	if code := runPreflightDeployResult(correctOwner); code != 0 {
+		t.Fatalf("deploy-result correct owner=%d want 0", code)
+	}
+	if code := runPreflightDeploy(deployArgs(dir, "s5", "deploy:k-owned")); code != 0 {
+		t.Fatalf("retry after correct owner=%d want allow (key should be freed)", code)
+	}
+}
+
 func TestRunPreflightDeployResultSuccessKeepsKey(t *testing.T) {
 	dir := t.TempDir()
 	if code := runPreflightDeploy(deployArgs(dir, "s1", "deploy:k2")); code != 0 {
